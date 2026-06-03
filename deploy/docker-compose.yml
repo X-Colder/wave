@@ -1,0 +1,25 @@
+services:
+  backend:
+    image: wave-backend:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - /opt/wave/002484:/app/002484:ro
+    environment:
+      - DATA_DIR=/app/002484
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  frontend:
+    image: wave-frontend:latest
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped

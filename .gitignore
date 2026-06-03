@@ -1,0 +1,9 @@
+002484/
+build/
+node_modules/
+__pycache__/
+.DS_Store
+web/dist/
+*.pyc
+/tmp/
+*.log
