@@ -507,6 +507,7 @@ class BacktestEngine:
 
         today_bought: float = 0.0
         last_trade_tick: int = -(s.min_trade_interval + 1)
+        last_regime: str = "neutral"
 
         data = flow_engine.process_day(day, df)
         if not data:
@@ -659,10 +660,32 @@ class BacktestEngine:
                 if trend_protect > 0:
                     target = position - reduction * (1.0 - trend_protect)
 
-            if regime["regime"] == "reversal_watch" and position_signal > -0.05:
-                target = max(target, min(max_pos, position + 0.20, 0.55))
-            elif regime["regime"] == "uptrend" and regime["reversal_score"] >= 0.55:
-                target = max(target, min(max_pos, 0.65))
+            regime_changed = regime["regime"] != last_regime
+            strong_reversal = (
+                regime["regime"] == "reversal_watch"
+                and position_signal > -0.05
+                and regime_changed
+                and (
+                    regime["cover_ratio"] >= 0.45
+                    or regime["reversal_score"] >= 0.58
+                    or recent_score > 0.10
+                )
+            )
+            confirmed_uptrend = (
+                regime["regime"] == "uptrend"
+                and regime_changed
+                and (
+                    regime["reversal_score"] >= 0.55
+                    or position_signal > 0.20
+                    or recent_score > 0.18
+                )
+            )
+
+            if strong_reversal:
+                target = max(target, min(max_pos, position + 0.30, 0.68))
+
+            if confirmed_uptrend:
+                target = max(target, min(max_pos, 0.78))
 
             # Periodic signal snapshot (every 100 ticks)
             if i % 100 == 0:
@@ -697,6 +720,7 @@ class BacktestEngine:
 
             # Open-auction protection: no trading before MIN_TICKS
             if i < MIN_TICKS:
+                last_regime = regime["regime"]
                 continue
 
             # End-of-day decay: linearly cap to min_pos over last 30 min (14:30-15:00)
@@ -718,7 +742,8 @@ class BacktestEngine:
 
             # T+1 constraint on buys
             if delta > 0:
-                max_buy = sellable + 0.3
+                add_room = 0.45 if (strong_reversal or confirmed_uptrend) else 0.3
+                max_buy = sellable + add_room
                 target = min(target, max_buy)
                 delta = target - position
 
@@ -730,10 +755,12 @@ class BacktestEngine:
             # Only act on meaningful changes; continuous trend updates can
             # still resize in 5% steps when strength changes persist.
             if abs(delta) < max(s.min_position_delta, 0.05):
+                last_regime = regime["regime"]
                 continue
 
             # Minimum trade interval
             if (i - last_trade_tick) < s.min_trade_interval:
+                last_regime = regime["regime"]
                 continue
             elif delta < 0:
                 actual_sell = min(abs(delta), sellable)
@@ -830,6 +857,7 @@ class BacktestEngine:
                 "delta": round(delta, 4),
                 "realized_pnl": round(realized_pnl, 2),
             })
+            last_regime = regime["regime"]
 
         return trades, signals, capital, _carry_out(
             position, avg_price, regime_tracker.to_state()
