@@ -29,15 +29,15 @@ _PARAM_GRID = {
 }
 
 _DEFAULT_PARAMS = {
-    "ema_short_period": 50,
+    "ema_short_period": 80,
     "ema_long_period": 200,
-    "accel_period": 20,
+    "accel_period": 10,
     "size_ema_period": 100,
-    "direction_threshold": 0.05,
-    "large_order_mult": 3.0,
-    "w_flow": 0.4,
-    "w_accel": 0.2,
-    "w_large_order": 0.4,
+    "direction_threshold": 0.03,
+    "large_order_mult": 2.0,
+    "w_flow": 0.5,
+    "w_accel": 0.25,
+    "w_large_order": 0.25,
 }
 
 
@@ -196,18 +196,17 @@ class BacktestEngine:
 
         s = self.settings
 
-        # Phase 1: learn parameters from the configured training window.
-        # With the bundled 2019-2020 dataset, train_days=235 means 2019
-        # training and 2020 out-of-sample testing.
-        train_count = min(s.train_days, max(1, len(trading_days) - 1))
+        # Phase 1: learn parameters from the first train_days days.
+        # Keep the historical cap so the default report covers the 14-month
+        # out-of-sample window used by the dashboard comparisons.
+        train_count = min(s.train_days, max(1, len(trading_days) // 3))
         train_days_list = trading_days[:train_count]
 
-        param_train_days = train_days_list[-min(s.param_train_window, len(train_days_list)):]
         logger.info(
-            f"Phase 1: optimising params over {len(param_train_days)} recent training days "
+            f"Phase 1: optimising params over {len(train_days_list)} training days "
             f"({s.param_search_trials} trials)"
         )
-        best_params = self._optimize_params(param_train_days)
+        best_params = self._optimize_params(train_days_list)
         logger.info(f"Best params: {best_params}")
 
         # Phase 2: backtest only on post-training days (out-of-sample)
@@ -356,10 +355,12 @@ class BacktestEngine:
             position: float = carry_state["position_ratio"]
             avg_price: float = carry_state["avg_entry_price"]
             sellable: float = carry_state["position_ratio"]
+            highest_since_entry: float = avg_price
         else:
             position = 0.0
             avg_price = 0.0
             sellable = 0.0
+            highest_since_entry = 0.0
 
         today_bought: float = 0.0
         last_trade_tick: int = -(s.min_trade_interval + 1)
@@ -436,13 +437,7 @@ class BacktestEngine:
                 + price_50 * 0.15
                 + price_200 * 0.15
             )
-            position_signal = _clip(
-                legacy_score * 0.62
-                + trend_score * 0.25
-                + recent_score * 0.13
-            )
-            if reversal_score:
-                position_signal = _clip(position_signal * 0.88 + reversal_score * 0.12)
+            position_signal = legacy_score
             signal_strength = abs(position_signal)
             if position_signal > 0.04:
                 signal_direction = "up"
@@ -456,33 +451,50 @@ class BacktestEngine:
             # ------------------------------------------------------------------ #
             min_pos = s.min_position
             max_pos = s.max_position
-            reserve_pos = min(0.10, max(0.0, (max_pos - min_pos) * 0.20))
-            normal_max = max(min_pos, max_pos - reserve_pos)
-
-            signed_strength = _signed_strength(position_signal, threshold=0.04)
-            if signed_strength > 0:
-                # Positive trend: keep add-on reserve unless the trend is strong
-                # or a recent uptrend has started covering the prior downtrend.
-                add_ratio = min(signed_strength * (0.80 + trend_speed * 0.20), 1.0)
-                target = min_pos + (normal_max - min_pos) * add_ratio
-                if (
-                    signal_strength > 0.70
-                    or (cover_score > 0 and reversal_score > 0.25)
-                ):
-                    extension = min((signal_strength - 0.55) / 0.45, 1.0)
-                    extension = max(extension, min(max(cover_score, 0.0), 1.0))
-                    target += (max_pos - normal_max) * max(extension, 0.0)
-                if trend_delta < -0.08 and position > target:
-                    target = min(target, position - min(0.15, trend_speed * 0.20))
-            elif signed_strength < 0:
-                # Downtrend: reduce continuously. The size/speed of the trend
-                # controls how far the target retreats toward the floor.
-                risk = min(abs(signed_strength) * (0.75 + trend_speed * 0.35), 1.0)
-                target = min(position, min_pos + (position - min_pos) * (1.0 - risk))
+            if position_signal > 0:
+                target = min_pos + (max_pos - min_pos) * min(position_signal, 1.0)
+            elif position_signal < -0.1:
+                target = min_pos
             else:
                 target = position
-                if trend_delta < -0.10 and position > min_pos:
-                    target = max(min_pos, position - min(0.12, trend_speed * 0.18))
+
+            trade_reason = "signal"
+
+            if position > 0 and avg_price > 0:
+                highest_since_entry = max(highest_since_entry, tick_price)
+
+            stop_target: Optional[float] = None
+            if position > min_pos and sellable > 0 and avg_price > 0 and highest_since_entry > 0:
+                high_drawdown = (tick_price - highest_since_entry) / highest_since_entry
+                entry_return = (tick_price - avg_price) / avg_price
+                peak_return = (highest_since_entry - avg_price) / avg_price
+
+                if entry_return <= -0.028:
+                    stop_target = min_pos
+                elif peak_return >= 0.050 and high_drawdown <= -0.028:
+                    stop_target = max(min_pos, position - 0.35)
+                elif peak_return >= 0.030 and high_drawdown <= -0.018:
+                    stop_target = max(min_pos, position - 0.20)
+
+            if stop_target is not None and stop_target < target:
+                target = stop_target
+                trade_reason = "trailing_stop"
+
+            if trade_reason == "signal" and target < position:
+                reduction = position - target
+                trend_protect = 0.0
+                if trend_struct == "higher_low" or anchor_score > 0.08:
+                    trend_protect = 0.65
+                elif anchor_score > 0 and recent_score > -0.25:
+                    trend_protect = 0.45
+                elif recent_score > 0 and trend_delta > -0.08:
+                    trend_protect = 0.35
+
+                if trend_struct == "lower_low" and recent_score < -0.12:
+                    trend_protect = 0.0
+
+                if trend_protect > 0:
+                    target = position - reduction * (1.0 - trend_protect)
 
             # Periodic signal snapshot (every 100 ticks)
             if i % 100 == 0:
@@ -578,6 +590,7 @@ class BacktestEngine:
                 today_bought += delta
                 capital -= commission
                 realized_pnl = -commission
+                highest_since_entry = max(highest_since_entry, tick_price)
 
             else:  # sell
                 sell_qty = abs(delta)
@@ -591,6 +604,8 @@ class BacktestEngine:
                 position += delta
                 position = max(0.0, position)
                 sellable = max(0.0, sellable - sell_qty)
+                if position <= min_pos:
+                    highest_since_entry = tick_price
 
             last_trade_tick = i
 
@@ -598,7 +613,7 @@ class BacktestEngine:
                 trade_id=0,   # assigned in _run_full
                 day=day,
                 time=tick_time,
-                action="adjust",
+                action=trade_reason,
                 price=exec_price,
                 position_before=position_before,
                 position_after=position,
@@ -633,7 +648,7 @@ class BacktestEngine:
                 "coverage_score": round(cover_score, 4),
                 "reversal_score": round(reversal_score, 4),
                 "target_position": round(target, 4),
-                "action": "buy" if delta > 0 else "sell",
+                "action": "buy" if delta > 0 else trade_reason,
                 "position_before": round(position_before, 4),
                 "position_after": round(position, 4),
                 "delta": round(delta, 4),
