@@ -297,43 +297,38 @@ class BacktestEngine:
                 continue
 
             # ------------------------------------------------------------------ #
-            # Multi-scale trend score                                              #
+            # Multi-scale trend score (flow-driven, price-confirmed)            #
             # ------------------------------------------------------------------ #
 
-            # Short term: last 50 ticks
+            # Flow signal from flow_engine (already incorporates EMA, large orders, streaks)
+            flow_sig = float(signal_scores[i])        # composite flow signal [-1,+1]
+            ns = float(norm_short_arr[i])              # short-term normalized flow
+            nl = float(norm_long_arr[i])               # long-term normalized flow
+
+            # Multi-scale flow accumulation (raw flows summed over windows)
             start_50 = max(0, i - 50)
-            price_50_ago = float(prices[start_50])
-            trend_short = (tick_price - price_50_ago) / price_50_ago
-            flow_short = float(np.sum(flows[start_50:i + 1]))
-
-            # Mid term: last 200 ticks
             start_200 = max(0, i - 200)
-            price_200_ago = float(prices[start_200])
-            trend_mid = (tick_price - price_200_ago) / price_200_ago
-            flow_mid = float(np.sum(flows[start_200:i + 1]))
-
-            # Long term: last 500 ticks
             start_500 = max(0, i - 500)
-            price_500_ago = float(prices[start_500])
-            trend_long = (tick_price - price_500_ago) / price_500_ago
 
-            # Normalise price changes
-            norm_s = trend_short * 100   # 1% → 1.0
-            norm_m = trend_mid * 50      # 2% → 1.0
-            norm_l = trend_long * 30     # 3% → 1.0
-
-            # Normalise flow relative to average trade size
             avg_size = max(float(size_ema[i]), 1.0)
-            flow_score_short = flow_short / (50.0 * avg_size)
-            flow_score_mid = flow_mid / (200.0 * avg_size)
+            flow_50 = float(np.sum(flows[start_50:i + 1])) / (50.0 * avg_size)
+            flow_200 = float(np.sum(flows[start_200:i + 1])) / (200.0 * avg_size)
+            flow_500 = float(np.sum(flows[start_500:i + 1])) / (500.0 * avg_size)
 
-            # Composite score in [-1, +1]
+            # Price confirmation (is price actually moving in flow direction?)
+            price_50 = (tick_price - float(prices[start_50])) / float(prices[start_50]) * 100
+            price_200 = (tick_price - float(prices[start_200])) / float(prices[start_200]) * 50
+
+            # Composite: flow-dominant (70%) + price-confirm (30%)
             trend_score = (
-                norm_s * 0.35
-                + norm_m * 0.25
-                + norm_l * 0.15
-                + flow_score_short * 0.15
-                + flow_score_mid * 0.10
+                flow_sig * 0.25 +         # flow_engine composite (EMA + large orders)
+                flow_50 * 0.15 +           # short accumulation
+                flow_200 * 0.10 +          # mid accumulation
+                flow_500 * 0.05 +          # long accumulation
+                ns * 0.10 +               # normalized short EMA
+                nl * 0.05 +               # normalized long EMA
+                price_50 * 0.15 +          # short price trend
+                price_200 * 0.15           # mid price trend
             )
             trend_score = max(-1.0, min(1.0, trend_score))
 
@@ -366,7 +361,7 @@ class BacktestEngine:
             target = max(min_pos, min(target, max_pos))
 
             # ------------------------------------------------------------------ #
-            # Adjust toward target                                                 #
+            # Adjust toward target (only on significant change)                 #
             # ------------------------------------------------------------------ #
             delta = target - position
 
@@ -381,13 +376,18 @@ class BacktestEngine:
                 actual_sell = min(abs(delta), sellable)
                 delta = -actual_sell
 
-            # Ignore micro-adjustments below threshold; still record sample
-            if abs(delta) < s.min_position_delta:
+            # Only act on significant changes (10%+ position shift)
+            if abs(delta) < 0.10:
                 continue
 
-            # Minimum trade interval throttle
+            # Minimum trade interval (50 ticks ≈ 1-3 minutes)
             if (i - last_trade_tick) < s.min_trade_interval:
                 continue
+            elif delta < 0:
+                actual_sell = min(abs(delta), sellable)
+                delta = -actual_sell
+
+            # (checks already above)
 
             # ------------------------------------------------------------------ #
             # Execute trade                                                        #
