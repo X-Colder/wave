@@ -164,6 +164,147 @@ class TrendSignalAnalyzer:
         }
 
 
+class TrendRegimeTracker:
+    """
+    Persistent trend-segment tracker.
+
+    This is not a fixed post-signal observation window. It carries the active
+    trend segment across ticks and days, updates the segment extreme, and
+    measures how much the opposite move has covered the active trend.
+    """
+
+    def __init__(self, state: Optional[dict] = None):
+        state = state or {}
+        self.direction = state.get("direction", "neutral")
+        self.start_price = float(state.get("start_price", 0.0))
+        self.extreme_price = float(state.get("extreme_price", 0.0))
+        self.start_step = int(state.get("start_step", 0))
+        self.extreme_step = int(state.get("extreme_step", 0))
+        self.step = int(state.get("step", 0))
+        self.last_price = float(state.get("last_price", 0.0))
+
+    def to_state(self) -> dict:
+        return {
+            "direction": self.direction,
+            "start_price": self.start_price,
+            "extreme_price": self.extreme_price,
+            "start_step": self.start_step,
+            "extreme_step": self.extreme_step,
+            "step": self.step,
+            "last_price": self.last_price,
+        }
+
+    def update(self, price: float, flow_signal: float, trend_score: float) -> dict:
+        self.step += 1
+
+        if self.start_price <= 0:
+            self.start_price = price
+            self.extreme_price = price
+            self.start_step = self.step
+            self.extreme_step = self.step
+            self.last_price = price
+            return self._snapshot("neutral", 0.0, 0.0, 0.0, 0.0)
+
+        move_from_start = (price - self.start_price) / self.start_price
+        if self.direction == "neutral":
+            if move_from_start <= -0.006 or trend_score < -0.12:
+                self.direction = "down"
+                self.extreme_price = price
+                self.extreme_step = self.step
+            elif move_from_start >= 0.006 or trend_score > 0.12:
+                self.direction = "up"
+                self.extreme_price = price
+                self.extreme_step = self.step
+
+        if self.direction == "down":
+            if price < self.extreme_price:
+                self.extreme_price = price
+                self.extreme_step = self.step
+
+            down_move = min((self.extreme_price - self.start_price) / self.start_price, 0.0)
+            rebound = max((price - self.extreme_price) / self.extreme_price, 0.0)
+            cover_ratio = min(rebound / max(abs(down_move), 1e-6), 2.0)
+            down_speed = abs(down_move) / max(self.extreme_step - self.start_step, 1)
+            rebound_speed = rebound / max(self.step - self.extreme_step, 1)
+            speed_ratio = min(rebound_speed / max(down_speed, 1e-6), 2.0)
+            flow_reversal = _clip((flow_signal + 0.15) / 0.45, 0.0, 1.0)
+            reversal_score = _clip(
+                min(cover_ratio, 1.0) * 0.50
+                + min(speed_ratio / 1.5, 1.0) * 0.30
+                + flow_reversal * 0.20,
+                0.0,
+                1.0,
+            )
+
+            if cover_ratio >= 0.72 and speed_ratio >= 0.55 and flow_signal > -0.05:
+                regime = "uptrend"
+                self.direction = "up"
+                self.start_price = self.extreme_price
+                self.start_step = self.extreme_step
+                self.extreme_price = price
+                self.extreme_step = self.step
+            elif cover_ratio >= 0.45 or reversal_score >= 0.58:
+                regime = "reversal_watch"
+            elif cover_ratio >= 0.25 or reversal_score >= 0.42:
+                regime = "down_exhaustion"
+            else:
+                regime = "downtrend"
+
+            self.last_price = price
+            return self._snapshot(regime, down_move, rebound, cover_ratio, speed_ratio, reversal_score)
+
+        if self.direction == "up":
+            if price > self.extreme_price:
+                self.extreme_price = price
+                self.extreme_step = self.step
+
+            up_move = max((self.extreme_price - self.start_price) / self.start_price, 0.0)
+            pullback = max((self.extreme_price - price) / self.extreme_price, 0.0)
+            cover_ratio = min(pullback / max(up_move, 1e-6), 2.0)
+            up_speed = up_move / max(self.extreme_step - self.start_step, 1)
+            pullback_speed = pullback / max(self.step - self.extreme_step, 1)
+            speed_ratio = min(pullback_speed / max(up_speed, 1e-6), 2.0)
+
+            if cover_ratio >= 0.72 and speed_ratio >= 0.70 and flow_signal < 0.05:
+                regime = "downtrend"
+                self.direction = "down"
+                self.start_price = self.extreme_price
+                self.start_step = self.extreme_step
+                self.extreme_price = price
+                self.extreme_step = self.step
+            elif cover_ratio >= 0.45:
+                regime = "up_exhaustion"
+            else:
+                regime = "uptrend"
+
+            self.last_price = price
+            return self._snapshot(regime, up_move, pullback, cover_ratio, speed_ratio)
+
+        self.last_price = price
+        return self._snapshot("neutral", 0.0, 0.0, 0.0, 0.0)
+
+    def _snapshot(
+        self,
+        regime: str,
+        active_move: float,
+        opposite_move: float,
+        cover_ratio: float,
+        speed_ratio: float,
+        reversal_score: float = 0.0,
+    ) -> dict:
+        return {
+            "regime": regime,
+            "active_direction": self.direction,
+            "active_move": active_move,
+            "opposite_move": opposite_move,
+            "cover_ratio": cover_ratio,
+            "speed_ratio": speed_ratio,
+            "reversal_score": reversal_score,
+            "segment_ticks": max(self.step - self.start_step, 0),
+            "extreme_age": max(self.step - self.extreme_step, 0),
+        }
+
+
 
 
 class BacktestEngine:
@@ -356,18 +497,22 @@ class BacktestEngine:
             avg_price: float = carry_state["avg_entry_price"]
             sellable: float = carry_state["position_ratio"]
             highest_since_entry: float = avg_price
+            regime_tracker = TrendRegimeTracker(carry_state.get("trend_state"))
         else:
             position = 0.0
             avg_price = 0.0
             sellable = 0.0
             highest_since_entry = 0.0
+            regime_tracker = TrendRegimeTracker()
 
         today_bought: float = 0.0
         last_trade_tick: int = -(s.min_trade_interval + 1)
 
         data = flow_engine.process_day(day, df)
         if not data:
-            return trades, signals, capital, _carry_out(position, avg_price)
+            return trades, signals, capital, _carry_out(
+                position, avg_price, regime_tracker.to_state()
+            )
 
         prices = data["prices"]
         flows = data["flows"]
@@ -445,6 +590,7 @@ class BacktestEngine:
                 signal_direction = "down"
             else:
                 signal_direction = "neutral"
+            regime = regime_tracker.update(tick_price, sig, trend_score)
 
             # ------------------------------------------------------------------ #
             # Map score to target position                                         #
@@ -480,21 +626,43 @@ class BacktestEngine:
                 target = stop_target
                 trade_reason = "trailing_stop"
 
+            if trade_reason == "trailing_stop" and regime["regime"] in {
+                "down_exhaustion",
+                "reversal_watch",
+            }:
+                if entry_return > -0.028:
+                    target = max(target, position - 0.15)
+
             if trade_reason == "signal" and target < position:
                 reduction = position - target
                 trend_protect = 0.0
-                if trend_struct == "higher_low" or anchor_score > 0.08:
+                if regime["regime"] == "reversal_watch":
+                    trend_protect = 0.88
+                elif regime["regime"] == "down_exhaustion":
+                    trend_protect = 0.75
+                elif regime["regime"] == "uptrend":
+                    trend_protect = 0.70
+                elif trend_struct == "higher_low" or anchor_score > 0.08:
                     trend_protect = 0.65
                 elif anchor_score > 0 and recent_score > -0.25:
                     trend_protect = 0.45
                 elif recent_score > 0 and trend_delta > -0.08:
                     trend_protect = 0.35
 
-                if trend_struct == "lower_low" and recent_score < -0.12:
+                if (
+                    regime["regime"] == "downtrend"
+                    and trend_struct == "lower_low"
+                    and recent_score < -0.12
+                ):
                     trend_protect = 0.0
 
                 if trend_protect > 0:
                     target = position - reduction * (1.0 - trend_protect)
+
+            if regime["regime"] == "reversal_watch" and position_signal > -0.05:
+                target = max(target, min(max_pos, position + 0.20, 0.55))
+            elif regime["regime"] == "uptrend" and regime["reversal_score"] >= 0.55:
+                target = max(target, min(max_pos, 0.65))
 
             # Periodic signal snapshot (every 100 ticks)
             if i % 100 == 0:
@@ -519,6 +687,10 @@ class BacktestEngine:
                     "anchor_score": round(anchor_score, 4),
                     "coverage_score": round(cover_score, 4),
                     "reversal_score": round(reversal_score, 4),
+                    "regime": regime["regime"],
+                    "regime_cover": round(regime["cover_ratio"], 4),
+                    "regime_speed": round(regime["speed_ratio"], 4),
+                    "regime_reversal_score": round(regime["reversal_score"], 4),
                     "target_position": round(target, 4),
                     "action": "sample",
                 })
@@ -647,6 +819,10 @@ class BacktestEngine:
                 "anchor_score": round(anchor_score, 4),
                 "coverage_score": round(cover_score, 4),
                 "reversal_score": round(reversal_score, 4),
+                "regime": regime["regime"],
+                "regime_cover": round(regime["cover_ratio"], 4),
+                "regime_speed": round(regime["speed_ratio"], 4),
+                "regime_reversal_score": round(regime["reversal_score"], 4),
                 "target_position": round(target, 4),
                 "action": "buy" if delta > 0 else trade_reason,
                 "position_before": round(position_before, 4),
@@ -655,7 +831,9 @@ class BacktestEngine:
                 "realized_pnl": round(realized_pnl, 2),
             })
 
-        return trades, signals, capital, _carry_out(position, avg_price)
+        return trades, signals, capital, _carry_out(
+            position, avg_price, regime_tracker.to_state()
+        )
 
     @staticmethod
     def _empty_result() -> BacktestResult:
@@ -670,7 +848,15 @@ class BacktestEngine:
         )
 
 
-def _carry_out(position: float, avg_price: float) -> Optional[dict]:
+def _carry_out(
+    position: float,
+    avg_price: float,
+    trend_state: Optional[dict] = None,
+) -> Optional[dict]:
     if position > 0.01:
-        return {"position_ratio": position, "avg_entry_price": avg_price}
+        return {
+            "position_ratio": position,
+            "avg_entry_price": avg_price,
+            "trend_state": trend_state or {},
+        }
     return None
