@@ -685,7 +685,7 @@ class BacktestEngine:
                 target = max(target, min(max_pos, position + 0.30, 0.68))
 
             if confirmed_uptrend:
-                target = max(target, min(max_pos, 0.78))
+                target = max(target, min(max_pos, 0.80))
 
             # Periodic signal snapshot (every 100 ticks)
             if i % 100 == 0:
