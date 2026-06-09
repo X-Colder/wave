@@ -7,15 +7,16 @@ class Settings(BaseSettings):
 
     # Parameter learning: use first N days to optimize params via random search
     train_days: int = 235
+    param_train_window: int = 160
     param_search_trials: int = 50
 
     # Position management
     min_position: float = 0.2
     max_position: float = 0.8
-    min_position_delta: float = 0.05
+    min_position_delta: float = 0.125
 
     # Minimum tick interval between two consecutive trades (throttle)
-    min_trade_interval: int = 100
+    min_trade_interval: int = 50
 
     # Cost parameters
     commission_rate: float = 0.001

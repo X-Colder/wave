@@ -51,6 +51,119 @@ def _normalize_weights(params: dict) -> dict:
     return params
 
 
+def _clip(value: float, low: float = -1.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def _signed_strength(value: float, threshold: float = 0.03) -> float:
+    if value > threshold:
+        return min((value - threshold) / (1.0 - threshold), 1.0)
+    if value < -threshold:
+        return -min((-value - threshold) / (1.0 - threshold), 1.0)
+    return 0.0
+
+
+class TrendSignalAnalyzer:
+    """
+    Continuous multi-scale trend signal.
+
+    The analyzer treats trend direction, strength, reversal, and recent-vs-prior
+    coverage as signal components. It is intentionally independent from signal
+    flip counts; every evaluated tick gets a fresh view across 20/50/100/200
+    tick windows.
+    """
+
+    _WINDOWS = (
+        (20, 0.28, 140.0),
+        (50, 0.26, 95.0),
+        (100, 0.23, 70.0),
+        (200, 0.23, 50.0),
+    )
+
+    def __init__(self) -> None:
+        self._previous_score = 0.0
+
+    def evaluate(
+        self,
+        i: int,
+        prices: np.ndarray,
+        flows: np.ndarray,
+        size_ema: np.ndarray,
+        flow_sig: float,
+        norm_short: float,
+        norm_long: float,
+    ) -> dict:
+        tick_price = float(prices[i])
+        avg_size = max(float(size_ema[i]), 1.0)
+        components: Dict[int, float] = {}
+        weighted_score = 0.0
+
+        for window, weight, price_scale in self._WINDOWS:
+            start = max(0, i - window)
+            base_price = max(float(prices[start]), 1e-9)
+            price_score = (tick_price - base_price) / base_price * price_scale
+            actual_window = max(i - start + 1, 1)
+            flow_score = float(np.sum(flows[start:i + 1])) / (actual_window * avg_size)
+            component = _clip(price_score * 0.65 + flow_score * 0.35)
+            components[window] = component
+            weighted_score += component * weight
+
+        recent_score = _clip(components[20] * 0.62 + components[50] * 0.38)
+        anchor_score = _clip(components[100] * 0.38 + components[200] * 0.62)
+        coverage_score = 0.0
+        reversal_score = 0.0
+
+        if recent_score * anchor_score < 0 and abs(recent_score) > 0.06:
+            coverage_score = _clip(abs(recent_score) - abs(anchor_score), -1.0, 1.0)
+            if coverage_score > -0.08:
+                reversal_score = np.sign(recent_score) * min(
+                    abs(recent_score) / max(abs(anchor_score) + 0.08, 0.08),
+                    1.0,
+                )
+
+        score = (
+            weighted_score * 0.55
+            + recent_score * 0.18
+            + anchor_score * 0.10
+            + flow_sig * 0.10
+            + norm_short * 0.04
+            + norm_long * 0.03
+        )
+        if reversal_score:
+            score = score * 0.82 + reversal_score * 0.18
+
+        score = _clip(score)
+        delta = score - self._previous_score
+        self._previous_score = score
+
+        trend_speed = _clip(
+            abs(recent_score - anchor_score) * 0.65 + abs(delta) * 2.0,
+            0.0,
+            1.0,
+        )
+        trend_strength = abs(score)
+
+        if score > 0.04:
+            direction = "up"
+        elif score < -0.04:
+            direction = "down"
+        else:
+            direction = "neutral"
+
+        return {
+            "trend_score": score,
+            "trend_strength": trend_strength,
+            "trend_speed": trend_speed,
+            "trend_delta": delta,
+            "trend_direction": direction,
+            "recent_score": recent_score,
+            "anchor_score": anchor_score,
+            "coverage_score": coverage_score,
+            "reversal_score": reversal_score,
+            "components": components,
+        }
+
+
 
 
 class BacktestEngine:
@@ -83,15 +196,18 @@ class BacktestEngine:
 
         s = self.settings
 
-        # Phase 1: learn parameters from the first train_days days
-        train_count = min(s.train_days, max(1, len(trading_days) // 3))
+        # Phase 1: learn parameters from the configured training window.
+        # With the bundled 2019-2020 dataset, train_days=235 means 2019
+        # training and 2020 out-of-sample testing.
+        train_count = min(s.train_days, max(1, len(trading_days) - 1))
         train_days_list = trading_days[:train_count]
 
+        param_train_days = train_days_list[-min(s.param_train_window, len(train_days_list)):]
         logger.info(
-            f"Phase 1: optimising params over {len(train_days_list)} training days "
+            f"Phase 1: optimising params over {len(param_train_days)} recent training days "
             f"({s.param_search_trials} trials)"
         )
-        best_params = self._optimize_params(train_days_list)
+        best_params = self._optimize_params(param_train_days)
         logger.info(f"Best params: {best_params}")
 
         # Phase 2: backtest only on post-training days (out-of-sample)
@@ -266,6 +382,7 @@ class BacktestEngine:
         signal_trends = data["signal_trend"]
 
         n = len(prices)
+        trend_analyzer = TrendSignalAnalyzer()
 
         for i in range(0, n, EVAL_INTERVAL):
             tick_price = float(prices[i])
@@ -276,77 +393,127 @@ class BacktestEngine:
             trend_struct = str(trend_structures[i])
             signal_trend = str(signal_trends[i])
 
-            # Periodic signal snapshot (every 100 ticks)
-            if i % 100 == 0:
-                signals.append({
-                    "time": tick_time.strftime("%H:%M:%S"),
-                    "price": round(tick_price, 4),
-                    "direction": direction,
-                    "signal_score": round(sig, 4),
-                    "speed": round(spd, 4),
-                    "norm_short": round(float(norm_short_arr[i]), 4),
-                    "norm_long": round(float(norm_long_arr[i]), 4),
-                    "position": round(position, 4),
-                    "trend_structure": trend_struct,
-                    "signal_trend": signal_trend,
-                    "action": "sample",
-                })
-
-            # Open-auction protection: no trading before MIN_TICKS
-            if i < MIN_TICKS:
-                continue
-
             # ------------------------------------------------------------------ #
-            # Multi-scale trend score (flow-driven, price-confirmed)            #
+            # Continuous trend signal                                             #
             # ------------------------------------------------------------------ #
+            ns = float(norm_short_arr[i])
+            nl = float(norm_long_arr[i])
+            trend = trend_analyzer.evaluate(
+                i=i,
+                prices=prices,
+                flows=flows,
+                size_ema=size_ema,
+                flow_sig=sig,
+                norm_short=ns,
+                norm_long=nl,
+            )
+            trend_score = float(trend["trend_score"])
+            trend_strength = float(trend["trend_strength"])
+            trend_speed = float(trend["trend_speed"])
+            trend_delta = float(trend["trend_delta"])
+            trend_direction = str(trend["trend_direction"])
+            cover_score = float(trend["coverage_score"])
+            reversal_score = float(trend["reversal_score"])
+            recent_score = float(trend["recent_score"])
+            anchor_score = float(trend["anchor_score"])
 
-            # Flow signal from flow_engine (already incorporates EMA, large orders, streaks)
-            flow_sig = float(signal_scores[i])        # composite flow signal [-1,+1]
-            ns = float(norm_short_arr[i])              # short-term normalized flow
-            nl = float(norm_long_arr[i])               # long-term normalized flow
-
-            # Multi-scale flow accumulation (raw flows summed over windows)
             start_50 = max(0, i - 50)
             start_200 = max(0, i - 200)
             start_500 = max(0, i - 500)
-
             avg_size = max(float(size_ema[i]), 1.0)
             flow_50 = float(np.sum(flows[start_50:i + 1])) / (50.0 * avg_size)
             flow_200 = float(np.sum(flows[start_200:i + 1])) / (200.0 * avg_size)
             flow_500 = float(np.sum(flows[start_500:i + 1])) / (500.0 * avg_size)
-
-            # Price confirmation (is price actually moving in flow direction?)
             price_50 = (tick_price - float(prices[start_50])) / float(prices[start_50]) * 100
             price_200 = (tick_price - float(prices[start_200])) / float(prices[start_200]) * 50
-
-            # Composite: flow-dominant (70%) + price-confirm (30%)
-            trend_score = (
-                flow_sig * 0.25 +         # flow_engine composite (EMA + large orders)
-                flow_50 * 0.15 +           # short accumulation
-                flow_200 * 0.10 +          # mid accumulation
-                flow_500 * 0.05 +          # long accumulation
-                ns * 0.10 +               # normalized short EMA
-                nl * 0.05 +               # normalized long EMA
-                price_50 * 0.15 +          # short price trend
-                price_200 * 0.15           # mid price trend
+            legacy_score = _clip(
+                sig * 0.25
+                + flow_50 * 0.15
+                + flow_200 * 0.10
+                + flow_500 * 0.05
+                + ns * 0.10
+                + nl * 0.05
+                + price_50 * 0.15
+                + price_200 * 0.15
             )
-            trend_score = max(-1.0, min(1.0, trend_score))
+            position_signal = _clip(
+                legacy_score * 0.62
+                + trend_score * 0.25
+                + recent_score * 0.13
+            )
+            if reversal_score:
+                position_signal = _clip(position_signal * 0.88 + reversal_score * 0.12)
+            signal_strength = abs(position_signal)
+            if position_signal > 0.04:
+                signal_direction = "up"
+            elif position_signal < -0.04:
+                signal_direction = "down"
+            else:
+                signal_direction = "neutral"
 
             # ------------------------------------------------------------------ #
             # Map score to target position                                         #
             # ------------------------------------------------------------------ #
             min_pos = s.min_position
             max_pos = s.max_position
+            reserve_pos = min(0.10, max(0.0, (max_pos - min_pos) * 0.20))
+            normal_max = max(min_pos, max_pos - reserve_pos)
 
-            if trend_score > 0:
-                # Positive trend: scale position from min_pos up to max_pos
-                target = min_pos + (max_pos - min_pos) * min(trend_score, 1.0)
-            elif trend_score < -0.1:
-                # Confirmed downtrend: retreat to floor
-                target = min_pos
+            signed_strength = _signed_strength(position_signal, threshold=0.04)
+            if signed_strength > 0:
+                # Positive trend: keep add-on reserve unless the trend is strong
+                # or a recent uptrend has started covering the prior downtrend.
+                add_ratio = min(signed_strength * (0.80 + trend_speed * 0.20), 1.0)
+                target = min_pos + (normal_max - min_pos) * add_ratio
+                if (
+                    signal_strength > 0.70
+                    or (cover_score > 0 and reversal_score > 0.25)
+                ):
+                    extension = min((signal_strength - 0.55) / 0.45, 1.0)
+                    extension = max(extension, min(max(cover_score, 0.0), 1.0))
+                    target += (max_pos - normal_max) * max(extension, 0.0)
+                if trend_delta < -0.08 and position > target:
+                    target = min(target, position - min(0.15, trend_speed * 0.20))
+            elif signed_strength < 0:
+                # Downtrend: reduce continuously. The size/speed of the trend
+                # controls how far the target retreats toward the floor.
+                risk = min(abs(signed_strength) * (0.75 + trend_speed * 0.35), 1.0)
+                target = min(position, min_pos + (position - min_pos) * (1.0 - risk))
             else:
-                # Weak / ambiguous trend (-0.1 to 0): hold current
                 target = position
+                if trend_delta < -0.10 and position > min_pos:
+                    target = max(min_pos, position - min(0.12, trend_speed * 0.18))
+
+            # Periodic signal snapshot (every 100 ticks)
+            if i % 100 == 0:
+                signals.append({
+                    "time": tick_time.strftime("%H:%M:%S"),
+                    "price": round(tick_price, 4),
+                    "direction": signal_direction,
+                    "signal_score": round(sig, 4),
+                    "speed": round(max(spd, trend_speed), 4),
+                    "norm_short": round(ns, 4),
+                    "norm_long": round(nl, 4),
+                    "position": round(position, 4),
+                    "trend_structure": trend_struct,
+                    "signal_trend": signal_trend,
+                    "trend_score": round(trend_score, 4),
+                    "trend_strength": round(trend_strength, 4),
+                    "trend_speed": round(trend_speed, 4),
+                    "trend_delta": round(trend_delta, 4),
+                    "legacy_score": round(legacy_score, 4),
+                    "position_signal": round(position_signal, 4),
+                    "recent_score": round(recent_score, 4),
+                    "anchor_score": round(anchor_score, 4),
+                    "coverage_score": round(cover_score, 4),
+                    "reversal_score": round(reversal_score, 4),
+                    "target_position": round(target, 4),
+                    "action": "sample",
+                })
+
+            # Open-auction protection: no trading before MIN_TICKS
+            if i < MIN_TICKS:
+                continue
 
             # End-of-day decay: linearly cap to min_pos over last 30 min (14:30-15:00)
             t = tick_time.time()
@@ -376,11 +543,12 @@ class BacktestEngine:
                 actual_sell = min(abs(delta), sellable)
                 delta = -actual_sell
 
-            # Only act on significant changes (10%+ position shift)
-            if abs(delta) < 0.10:
+            # Only act on meaningful changes; continuous trend updates can
+            # still resize in 5% steps when strength changes persist.
+            if abs(delta) < max(s.min_position_delta, 0.05):
                 continue
 
-            # Minimum trade interval (50 ticks ≈ 1-3 minutes)
+            # Minimum trade interval
             if (i - last_trade_tick) < s.min_trade_interval:
                 continue
             elif delta < 0:
@@ -435,9 +603,9 @@ class BacktestEngine:
                 position_before=position_before,
                 position_after=position,
                 position_delta=delta,
-                direction=direction,
-                speed=spd,
-                signal_score=sig,
+                direction=signal_direction,
+                speed=max(spd, trend_speed),
+                signal_score=position_signal,
                 realized_pnl=realized_pnl,
                 capital_after=capital,
             )
@@ -446,14 +614,25 @@ class BacktestEngine:
             signals.append({
                 "time": tick_time.strftime("%H:%M:%S"),
                 "price": round(exec_price, 4),
-                "direction": direction,
+                "direction": signal_direction,
                 "signal_score": round(sig, 4),
-                "speed": round(spd, 4),
+                "speed": round(max(spd, trend_speed), 4),
                 "norm_short": round(float(norm_short_arr[i]), 4),
                 "norm_long": round(float(norm_long_arr[i]), 4),
                 "position": round(position, 4),
                 "trend_structure": trend_struct,
                 "signal_trend": signal_trend,
+                "trend_score": round(trend_score, 4),
+                "trend_strength": round(trend_strength, 4),
+                "trend_speed": round(trend_speed, 4),
+                "trend_delta": round(trend_delta, 4),
+                "legacy_score": round(legacy_score, 4),
+                "position_signal": round(position_signal, 4),
+                "recent_score": round(recent_score, 4),
+                "anchor_score": round(anchor_score, 4),
+                "coverage_score": round(cover_score, 4),
+                "reversal_score": round(reversal_score, 4),
+                "target_position": round(target, 4),
                 "action": "buy" if delta > 0 else "sell",
                 "position_before": round(position_before, 4),
                 "position_after": round(position, 4),
