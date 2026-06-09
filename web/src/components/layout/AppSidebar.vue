@@ -12,6 +12,7 @@ const menuItems = [
   { path: '/patterns', name: 'patterns', label: '模式分析', icon: 'Grid' },
   { path: '/trades', name: 'trades', label: '交易明细', icon: 'List' },
   { path: '/intraday', name: 'intraday', label: '日内查看', icon: 'TrendCharts' },
+  { path: '/playback', name: 'playback', label: '回测回放', icon: 'VideoPlay' },
 ]
 </script>
 

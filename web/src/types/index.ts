@@ -78,6 +78,9 @@ export interface Trade {
   pnl_type: string
   return_pct: number
   capital_after: number
+  high_after: number | null
+  high_after_pct: number | null
+  ticks_to_high: number | null
 }
 
 export interface TradesStats {

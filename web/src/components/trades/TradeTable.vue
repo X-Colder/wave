@@ -89,9 +89,32 @@ function onPageChange(p: number) {
           </span>
         </template>
       </el-table-column>
-      <el-table-column label="资金" width="85">
+      <el-table-column label="资金" width="75">
         <template #default="{ row }">
           <span class="text-muted">{{ (row.capital_after / 1000).toFixed(1) }}k</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="后高" width="65">
+        <template #default="{ row }">
+          <span v-if="row.high_after" class="text-profit">{{ row.high_after.toFixed(2) }}</span>
+          <span v-else class="text-muted">-</span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="high_after_pct" label="遗留%" width="65" sortable="custom">
+        <template #default="{ row }">
+          <span v-if="row.high_after_pct != null && row.high_after_pct > 0" class="text-profit">
+            +{{ row.high_after_pct.toFixed(1) }}%
+          </span>
+          <span v-else-if="row.high_after_pct != null" class="text-muted">
+            {{ row.high_after_pct.toFixed(1) }}%
+          </span>
+          <span v-else class="text-muted">-</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="距高tick" width="70">
+        <template #default="{ row }">
+          <span v-if="row.ticks_to_high != null" class="text-muted">{{ row.ticks_to_high }}</span>
+          <span v-else class="text-muted">-</span>
         </template>
       </el-table-column>
     </el-table>

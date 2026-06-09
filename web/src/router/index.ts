@@ -27,6 +27,11 @@ const router = createRouter({
           name: 'intraday',
           component: () => import('@/views/IntradayView.vue'),
         },
+        {
+          path: 'playback',
+          name: 'playback',
+          component: () => import('@/views/PlaybackView.vue'),
+        },
       ],
     },
   ],

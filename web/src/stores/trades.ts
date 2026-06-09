@@ -11,12 +11,19 @@ export const useTradesStore = defineStore('trades', () => {
   const error = ref<string | null>(null)
   const page = ref(1)
   const size = ref(50)
+  const sortBy = ref('')
+  const sortOrder = ref('desc')
 
   async function load() {
     loading.value = true
     error.value = null
     try {
-      const res = await fetchTrades({ page: page.value, size: size.value })
+      const params: Record<string, string | number> = { page: page.value, size: size.value }
+      if (sortBy.value) {
+        params.sort_by = sortBy.value
+        params.sort_order = sortOrder.value
+      }
+      const res = await fetchTrades(params)
       trades.value = res.data.trades
       stats.value = res.data.stats
       total.value = res.data.total
@@ -32,5 +39,12 @@ export const useTradesStore = defineStore('trades', () => {
     load()
   }
 
-  return { trades, stats, total, loading, error, page, size, load, setPage }
+  function setSort(field: string, order: string) {
+    sortBy.value = field
+    sortOrder.value = order === 'ascending' ? 'asc' : 'desc'
+    page.value = 1
+    load()
+  }
+
+  return { trades, stats, total, loading, error, page, size, sortBy, sortOrder, load, setPage, setSort }
 })

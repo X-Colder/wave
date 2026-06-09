@@ -1,6 +1,6 @@
 import client from './client'
-import type { TradesData, PageQuery } from '@/types'
+import type { TradesData } from '@/types'
 
-export function fetchTrades(params: PageQuery) {
+export function fetchTrades(params: Record<string, string | number>) {
   return client.get<TradesData>('/trades', { params })
 }

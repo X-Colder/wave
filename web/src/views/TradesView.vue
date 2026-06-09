@@ -14,8 +14,12 @@ function onPageChange(page: number) {
   store.setPage(page)
 }
 
-function onSortChange(_sort: { prop: string; order: string }) {
-  store.load()
+function onSortChange(sort: { prop: string; order: string }) {
+  if (sort.prop && sort.order) {
+    store.setSort(sort.prop, sort.order)
+  } else {
+    store.setSort('', 'desc')
+  }
 }
 </script>
 

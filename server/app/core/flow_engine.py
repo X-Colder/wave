@@ -57,7 +57,9 @@ class FlowEngine:
           norm_short, norm_long, norm_accel,
           order_sizes, size_ema,
           is_large (bool), large_buy_streak, large_sell_streak,
-          signal_score, direction (str array), speed
+          signal_score, direction (str array), speed,
+          trend_structure (str array: "higher_low"/"lower_low"/"flat"),
+          signal_trend (str array: "weakening"/"strengthening"/"neutral")
         """
         trading_df = _filter_trading_hours(df)
         n = len(trading_df)
@@ -159,6 +161,47 @@ class FlowEngine:
         direction[(nl > th) & (ns < -th)] = "pullback"
         direction[(nl < -th) & (ns > th)] = "bounce"
 
+        # ------------------------------------------------------------------ #
+        # Trend structure: higher_low / lower_low detection                   #
+        # Rolling window of 200 ticks; compare current rolling_low against    #
+        # the previous recorded rolling_low to classify trend structure.      #
+        # ------------------------------------------------------------------ #
+        rolling_low_window = 200
+        trend_structure = np.full(n, "flat", dtype=object)
+
+        prev_low: float = prices[0]  # last recorded rolling_low
+
+        for i in range(n):
+            start = max(0, i - rolling_low_window + 1)
+            current_rolling_low = float(np.min(prices[start: i + 1]))
+
+            if current_rolling_low > prev_low:
+                trend_structure[i] = "higher_low"
+            elif current_rolling_low < prev_low:
+                trend_structure[i] = "lower_low"
+                prev_low = current_rolling_low  # update on new low
+            else:
+                trend_structure[i] = "flat"
+
+        # ------------------------------------------------------------------ #
+        # Signal trend: weakening vs strengthening via slow EMA of signal     #
+        # alpha=0.005 => very slow EMA captures the "drift" direction         #
+        # ------------------------------------------------------------------ #
+        alpha_slow = 0.005
+        signal_ema_slow = np.empty(n, dtype=np.float64)
+        signal_ema_slow[0] = signal_score[0]
+        for i in range(1, n):
+            signal_ema_slow[i] = (
+                alpha_slow * signal_score[i] + (1.0 - alpha_slow) * signal_ema_slow[i - 1]
+            )
+
+        # weakening: |signal| moving toward 0 relative to its slow EMA
+        signal_trend = np.full(n, "neutral", dtype=object)
+        abs_sig = np.abs(signal_score)
+        abs_ema = np.abs(signal_ema_slow)
+        signal_trend[abs_sig < abs_ema] = "weakening"
+        signal_trend[abs_sig > abs_ema] = "strengthening"
+
         return {
             "times": trading_df["Datetime"].values,
             "prices": prices,
@@ -178,4 +221,6 @@ class FlowEngine:
             "signal_score": signal_score,
             "direction": direction,
             "speed": speed,
+            "trend_structure": trend_structure,
+            "signal_trend": signal_trend,
         }

@@ -51,49 +51,6 @@ def _normalize_weights(params: dict) -> dict:
     return params
 
 
-def _compute_target(
-    signal: float,
-    direction: str,
-    current_position: float,
-    tick_time: datetime,
-    day: date,
-    min_pos: float,
-    max_pos: float,
-) -> float:
-    """
-    Map signal score and direction to a target position ratio.
-
-    Ranges:
-      up:       0.5 + signal * 0.3  → ~50-80%
-      down:     min_pos
-      pullback: current * 0.85 floored at min_pos + 0.05
-      bounce:   min_pos
-      neutral:  unchanged
-    Also applies an end-of-day time decay from 14:30 onward.
-    """
-    t = tick_time.time()
-
-    if direction == "up":
-        target = 0.5 + signal * 0.3        # signal 0~1 → 50-80%
-    elif direction == "down":
-        target = min_pos
-    elif direction == "pullback":
-        target = max(current_position * 0.85, min_pos + 0.05)
-    elif direction == "bounce":
-        target = min_pos
-    else:  # neutral
-        target = current_position
-
-    # End-of-day decay: linearly cap from 0.5 → min_pos over the last 30 min
-    if t >= dtime(14, 30):
-        remaining_secs = (
-            datetime.combine(day, dtime(15, 0)) -
-            datetime.combine(day, t)
-        ).total_seconds()
-        max_eod = min_pos + (0.5 - min_pos) * (remaining_secs / 1800.0)
-        target = min(target, max_eod)
-
-    return max(min_pos, min(target, max_pos))
 
 
 class BacktestEngine:
@@ -137,9 +94,10 @@ class BacktestEngine:
         best_params = self._optimize_params(train_days_list)
         logger.info(f"Best params: {best_params}")
 
-        # Phase 2: full backtest with learned params
-        logger.info(f"Phase 2: running full backtest over {len(trading_days)} days")
-        trades, equity_curve, daily_signals = self._run_full(trading_days, best_params)
+        # Phase 2: backtest only on post-training days (out-of-sample)
+        test_days = trading_days[train_count:]
+        logger.info(f"Phase 2: running backtest over {len(test_days)} test days (out-of-sample)")
+        trades, equity_curve, daily_signals = self._run_full(test_days, best_params)
 
         metrics = compute_all_metrics(trades, equity_curve, s.initial_capital)
         monthly_rets = monthly_returns(trades, s.initial_capital)
@@ -251,21 +209,27 @@ class BacktestEngine:
         params: dict,
     ) -> Tuple[List[Trade], List[dict], float, Optional[dict]]:
         """
-        Simulate one trading day tick-by-tick.
+        Simulate one trading day using a unified multi-scale trend score.
+
+        Every EVAL_INTERVAL ticks the engine computes a trend score from
+        short/mid/long price momentum and net flow, maps that score to a
+        target position ratio, then adjusts toward the target.
 
         T+1 constraint:
           - ``sellable`` is initialised from the previous day's position.
           - Shares bought today (``today_bought``) may NOT be sold today.
           - New buys today are capped at ``sellable + 0.3`` to limit intraday risk.
 
-        Trade throttle:
-          - ``last_trade_tick`` prevents trades within ``min_trade_interval`` ticks
-            of each other.
-
         Signal sampling:
-          - Every 200 ticks a snapshot is appended to ``signals`` for the intraday
+          - Every 100 ticks a snapshot is appended to ``signals`` for the intraday
             API, regardless of whether a trade occurred.
+
+        Protection window:
+          - No trades are evaluated before MIN_TICKS (300) to avoid open-auction noise.
         """
+        EVAL_INTERVAL = 10   # evaluate target position every N ticks
+        MIN_TICKS = 300      # no-trade window at open
+
         s = self.settings
         trades: List[Trade] = []
         signals: List[dict] = []
@@ -281,131 +245,129 @@ class BacktestEngine:
             avg_price = 0.0
             sellable = 0.0
 
-        today_bought: float = 0.0          # shares bought today (not yet sellable)
+        today_bought: float = 0.0
         last_trade_tick: int = -(s.min_trade_interval + 1)
-
-        # Dynamic TP/SL state
-        entry_price_for_tp_sl: float = avg_price if position > 0 else 0.0
-        base_tp: float = 0.01   # initial take-profit 1%
-        base_sl: float = 0.005  # initial stop-loss 0.5%
-        highest_since_entry: float = avg_price if position > 0 else 0.0
 
         data = flow_engine.process_day(day, df)
         if not data:
             return trades, signals, capital, _carry_out(position, avg_price)
 
-        n = len(data["prices"])
-        times = data["times"]
         prices = data["prices"]
-        norm_short = data["norm_short"]
-        norm_long = data["norm_long"]
+        flows = data["flows"]
+        times = data["times"]
+        size_ema = data["size_ema"]
+        # Keep legacy signal fields for the signal snapshot record
         signal_scores = data["signal_score"]
         directions = data["direction"]
         speeds = data["speed"]
+        norm_short_arr = data["norm_short"]
+        norm_long_arr = data["norm_long"]
+        trend_structures = data["trend_structure"]
+        signal_trends = data["signal_trend"]
 
-        for i in range(n):
+        n = len(prices)
+
+        for i in range(0, n, EVAL_INTERVAL):
+            tick_price = float(prices[i])
+            tick_time = pd.Timestamp(times[i]).to_pydatetime()
             sig = float(signal_scores[i])
             direction = str(directions[i])
             spd = float(speeds[i])
-            tick_time = pd.Timestamp(times[i]).to_pydatetime()
-            tick_price = float(prices[i])
+            trend_struct = str(trend_structures[i])
+            signal_trend = str(signal_trends[i])
 
-            # Sample every 200 ticks for the intraday API
-            if i % 200 == 0:
+            # Periodic signal snapshot (every 100 ticks)
+            if i % 100 == 0:
                 signals.append({
                     "time": tick_time.strftime("%H:%M:%S"),
                     "price": round(tick_price, 4),
                     "direction": direction,
                     "signal_score": round(sig, 4),
                     "speed": round(spd, 4),
-                    "norm_short": round(float(norm_short[i]), 4),
-                    "norm_long": round(float(norm_long[i]), 4),
+                    "norm_short": round(float(norm_short_arr[i]), 4),
+                    "norm_long": round(float(norm_long_arr[i]), 4),
                     "position": round(position, 4),
+                    "trend_structure": trend_struct,
+                    "signal_trend": signal_trend,
                     "action": "sample",
                 })
 
-            # --- Dynamic TP/SL check (every tick, no throttle) ---
-            if position > s.min_position and entry_price_for_tp_sl > 0 and sellable > 0:
-                current_ret = (tick_price - entry_price_for_tp_sl) / entry_price_for_tp_sl
-                highest_since_entry = max(highest_since_entry, tick_price)
-
-                # Dynamic TP: expand in accelerating uptrend
-                dynamic_tp = base_tp * (1.0 + spd) if direction == 'up' else base_tp
-                # Trailing: if price has risen significantly, raise stop to lock profit
-                trailing_stop = (highest_since_entry - entry_price_for_tp_sl) / entry_price_for_tp_sl * 0.5
-                # Dynamic SL: shrink in expanding downtrend
-                dynamic_sl = base_sl * (0.5 if direction == 'down' and spd > 0.3 else 1.0)
-                effective_sl = max(dynamic_sl, trailing_stop)
-
-                tp_hit = current_ret >= dynamic_tp
-                sl_hit = current_ret <= -effective_sl
-
-                if (tp_hit or sl_hit) and (i - last_trade_tick) >= 30:
-                    sell_ratio = min(position - s.min_position, sellable)
-                    if sell_ratio >= 0.05:
-                        exec_price = tick_price * (1.0 - s.slippage_rate)
-                        commission = sell_ratio * capital * s.commission_rate
-                        gross_ret = (exec_price - avg_price) / avg_price if avg_price > 0 else 0.0
-                        realized_pnl = sell_ratio * capital * gross_ret - commission
-                        position_before = position
-
-                        capital += realized_pnl
-                        position -= sell_ratio
-                        position = max(0.0, position)
-                        sellable = max(0.0, sellable - sell_ratio)
-                        last_trade_tick = i
-
-                        trade = Trade(
-                            trade_id=0, day=day, time=tick_time,
-                            action="adjust", price=exec_price,
-                            position_before=position_before,
-                            position_after=position,
-                            position_delta=-sell_ratio,
-                            direction=direction, speed=spd,
-                            signal_score=sig, realized_pnl=realized_pnl,
-                            capital_after=capital,
-                        )
-                        trades.append(trade)
-                        signals.append({
-                            "time": tick_time.strftime("%H:%M:%S"),
-                            "price": round(exec_price, 4),
-                            "direction": direction,
-                            "signal_score": round(sig, 4),
-                            "speed": round(spd, 4),
-                            "norm_short": round(float(norm_short[i]), 4),
-                            "norm_long": round(float(norm_long[i]), 4),
-                            "position": round(position, 4),
-                            "action": "tp" if tp_hit else "sl",
-                            "position_before": round(position_before, 4),
-                            "position_after": round(position, 4),
-                            "delta": round(-sell_ratio, 4),
-                            "realized_pnl": round(realized_pnl, 2),
-                        })
-
-                        # Reset TP/SL for remaining position
-                        if position > s.min_position:
-                            entry_price_for_tp_sl = tick_price
-                            highest_since_entry = tick_price
-                        continue
-
-            # Throttle: skip signal-based trades if too soon
-            if (i - last_trade_tick) < s.min_trade_interval:
+            # Open-auction protection: no trading before MIN_TICKS
+            if i < MIN_TICKS:
                 continue
 
-            # --- Signal-based position adjustment ---
-            # Only reduce on strong negative signal (not mild wobbles)
-            target = _compute_target(
-                sig, direction, position,
-                tick_time, day,
-                s.min_position, s.max_position,
+            # ------------------------------------------------------------------ #
+            # Multi-scale trend score                                              #
+            # ------------------------------------------------------------------ #
+
+            # Short term: last 50 ticks
+            start_50 = max(0, i - 50)
+            price_50_ago = float(prices[start_50])
+            trend_short = (tick_price - price_50_ago) / price_50_ago
+            flow_short = float(np.sum(flows[start_50:i + 1]))
+
+            # Mid term: last 200 ticks
+            start_200 = max(0, i - 200)
+            price_200_ago = float(prices[start_200])
+            trend_mid = (tick_price - price_200_ago) / price_200_ago
+            flow_mid = float(np.sum(flows[start_200:i + 1]))
+
+            # Long term: last 500 ticks
+            start_500 = max(0, i - 500)
+            price_500_ago = float(prices[start_500])
+            trend_long = (tick_price - price_500_ago) / price_500_ago
+
+            # Normalise price changes
+            norm_s = trend_short * 100   # 1% → 1.0
+            norm_m = trend_mid * 50      # 2% → 1.0
+            norm_l = trend_long * 30     # 3% → 1.0
+
+            # Normalise flow relative to average trade size
+            avg_size = max(float(size_ema[i]), 1.0)
+            flow_score_short = flow_short / (50.0 * avg_size)
+            flow_score_mid = flow_mid / (200.0 * avg_size)
+
+            # Composite score in [-1, +1]
+            trend_score = (
+                norm_s * 0.35
+                + norm_m * 0.25
+                + norm_l * 0.15
+                + flow_score_short * 0.15
+                + flow_score_mid * 0.10
             )
+            trend_score = max(-1.0, min(1.0, trend_score))
 
-            # If we have TP/SL protecting the position, only allow signal-based sell
-            # when signal is strongly bearish (< -0.3)
-            if position > s.min_position and target < position:
-                if sig > -0.3:
-                    continue  # mild negative → let TP/SL handle it
+            # ------------------------------------------------------------------ #
+            # Map score to target position                                         #
+            # ------------------------------------------------------------------ #
+            min_pos = s.min_position
+            max_pos = s.max_position
 
+            if trend_score > 0:
+                # Positive trend: scale position from min_pos up to max_pos
+                target = min_pos + (max_pos - min_pos) * min(trend_score, 1.0)
+            elif trend_score < -0.1:
+                # Confirmed downtrend: retreat to floor
+                target = min_pos
+            else:
+                # Weak / ambiguous trend (-0.1 to 0): hold current
+                target = position
+
+            # End-of-day decay: linearly cap to min_pos over last 30 min (14:30-15:00)
+            t = tick_time.time()
+            if t >= dtime(14, 30):
+                remaining = (
+                    datetime.combine(day, dtime(15, 0))
+                    - datetime.combine(day, t)
+                ).total_seconds()
+                max_eod = min_pos + (0.5 - min_pos) * (remaining / 1800.0)
+                target = min(target, max_eod)
+
+            target = max(min_pos, min(target, max_pos))
+
+            # ------------------------------------------------------------------ #
+            # Adjust toward target                                                 #
+            # ------------------------------------------------------------------ #
             delta = target - position
 
             # T+1 constraint on buys
@@ -419,10 +381,17 @@ class BacktestEngine:
                 actual_sell = min(abs(delta), sellable)
                 delta = -actual_sell
 
+            # Ignore micro-adjustments below threshold; still record sample
             if abs(delta) < s.min_position_delta:
                 continue
 
-            # Execute trade
+            # Minimum trade interval throttle
+            if (i - last_trade_tick) < s.min_trade_interval:
+                continue
+
+            # ------------------------------------------------------------------ #
+            # Execute trade                                                        #
+            # ------------------------------------------------------------------ #
             position_before = position
             realized_pnl: float
 
@@ -442,31 +411,23 @@ class BacktestEngine:
                 capital -= commission
                 realized_pnl = -commission
 
-                # Reset TP/SL anchor on new entry/add
-                entry_price_for_tp_sl = avg_price
-                highest_since_entry = tick_price
-                # Adjust TP/SL based on current speed
-                base_tp = 0.008 + spd * 0.012  # speed 0→0.8%, speed 1→2%
-                base_sl = 0.005 - spd * 0.002  # speed 0→0.5%, speed 1→0.3%
-                base_sl = max(base_sl, 0.003)
-
             else:  # sell
-                sell_ratio = abs(delta)
+                sell_qty = abs(delta)
                 exec_price = tick_price * (1.0 - s.slippage_rate)
-                commission = sell_ratio * capital * s.commission_rate
+                commission = sell_qty * capital * s.commission_rate
 
                 gross_ret = (exec_price - avg_price) / avg_price if avg_price > 0 else 0.0
-                realized_pnl = sell_ratio * capital * gross_ret - commission
+                realized_pnl = sell_qty * capital * gross_ret - commission
 
                 capital += realized_pnl
                 position += delta
                 position = max(0.0, position)
-                sellable = max(0.0, sellable - sell_ratio)
+                sellable = max(0.0, sellable - sell_qty)
 
             last_trade_tick = i
 
             trade = Trade(
-                trade_id=0,          # assigned in _run_full
+                trade_id=0,   # assigned in _run_full
                 day=day,
                 time=tick_time,
                 action="adjust",
@@ -482,16 +443,17 @@ class BacktestEngine:
             )
             trades.append(trade)
 
-            # Add trade event to signals as well
             signals.append({
                 "time": tick_time.strftime("%H:%M:%S"),
                 "price": round(exec_price, 4),
                 "direction": direction,
                 "signal_score": round(sig, 4),
                 "speed": round(spd, 4),
-                "norm_short": round(float(norm_short[i]), 4),
-                "norm_long": round(float(norm_long[i]), 4),
+                "norm_short": round(float(norm_short_arr[i]), 4),
+                "norm_long": round(float(norm_long_arr[i]), 4),
                 "position": round(position, 4),
+                "trend_structure": trend_struct,
+                "signal_trend": signal_trend,
                 "action": "buy" if delta > 0 else "sell",
                 "position_before": round(position_before, 4),
                 "position_after": round(position, 4),

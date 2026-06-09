@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     data_dir: str = Field(default="./002484", alias="DATA_DIR")
 
     # Parameter learning: use first N days to optimize params via random search
-    train_days: int = 60
+    train_days: int = 235
     param_search_trials: int = 50
 
     # Position management
