@@ -573,6 +573,8 @@ class BacktestEngine:
             flow_500 = float(np.sum(flows[start_500:i + 1])) / (500.0 * avg_size)
             price_50 = (tick_price - float(prices[start_50])) / float(prices[start_50]) * 100
             price_200 = (tick_price - float(prices[start_200])) / float(prices[start_200]) * 50
+            recent_high_80 = float(np.max(prices[max(0, i - 80):i + 1]))
+            near_recent_breakout = tick_price >= recent_high_80 * 0.992
             legacy_score = _clip(
                 sig * 0.25
                 + flow_50 * 0.15
@@ -634,6 +636,16 @@ class BacktestEngine:
                 if entry_return > -0.028:
                     target = max(target, position - 0.15)
 
+            if (
+                trade_reason == "trailing_stop"
+                and regime["regime"] == "uptrend"
+                and trend_struct == "higher_low"
+                and recent_score > 0.05
+                and anchor_score > -0.35
+                and trend_score > -0.08
+            ):
+                target = max(target, position - 0.12)
+
             if trade_reason == "signal" and target < position:
                 reduction = position - target
                 trend_protect = 0.0
@@ -661,6 +673,16 @@ class BacktestEngine:
                     target = position - reduction * (1.0 - trend_protect)
 
             regime_changed = regime["regime"] != last_regime
+            uptrend_quality = (
+                regime["regime"] in {"down_exhaustion", "reversal_watch"}
+                and regime["cover_ratio"] >= 0.30
+                and regime["speed_ratio"] >= 1.20
+                and sig > 0.06
+                and ns > -0.05
+                and recent_score > 0.08
+                and position_signal > -0.02
+                and (trend_struct == "higher_low" or near_recent_breakout)
+            )
             strong_reversal = (
                 regime["regime"] == "reversal_watch"
                 and position_signal > -0.05
@@ -680,6 +702,10 @@ class BacktestEngine:
                     or recent_score > 0.18
                 )
             )
+
+            if uptrend_quality:
+                quality_cap = 0.66 if regime["regime"] == "down_exhaustion" else 0.70
+                target = max(target, min(max_pos, position + 0.26, quality_cap))
 
             if strong_reversal:
                 target = max(target, min(max_pos, position + 0.30, 0.68))
