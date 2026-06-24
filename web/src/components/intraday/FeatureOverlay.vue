@@ -10,15 +10,16 @@ const chartRef = ref<{ chart: { resize: () => void } } | null>(null)
 
 const filteredFeatures = computed(() => {
   return props.features.filter((f) => {
-    const time = f.time.slice(11, 16)
+    const time = f.time.slice(0, 5)
     return time < '11:30' || time >= '13:00'
   })
 })
 
 const option = computed(() => {
-  const times = filteredFeatures.value.map((f) => f.time.slice(11, 16))
-  const f1 = filteredFeatures.value.map((f) => f.short_slope)
-  const f2 = filteredFeatures.value.map((f) => f.long_slope)
+  const times = filteredFeatures.value.map((f) => f.time.slice(0, 5))
+  const f1 = filteredFeatures.value.map((f) => f.norm_short)
+  const f2 = filteredFeatures.value.map((f) => f.norm_long)
+  const f3 = filteredFeatures.value.map((f) => f.final_score)
 
   return {
     backgroundColor: 'transparent',
@@ -52,7 +53,7 @@ const option = computed(() => {
     dataZoom: [{ type: 'inside', start: 0, end: 100 }],
     series: [
       {
-        name: '短期斜率',
+        name: '短期流',
         type: 'line',
         data: f1,
         step: 'end',
@@ -60,12 +61,20 @@ const option = computed(() => {
         lineStyle: { color: '#409eff', width: 1.5 },
       },
       {
-        name: '长期斜率',
+        name: '长期流',
         type: 'line',
         data: f2,
         step: 'end',
         symbol: 'none',
         lineStyle: { color: '#e6a23c', width: 1.5 },
+      },
+      {
+        name: '最终分',
+        type: 'line',
+        data: f3,
+        step: 'end',
+        symbol: 'none',
+        lineStyle: { color: '#67c23a', width: 1.5 },
       },
     ],
   }

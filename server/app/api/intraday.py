@@ -66,6 +66,7 @@ async def get_intraday(
                 "norm_short": round(s.get("norm_short", 0), 4),
                 "norm_long": round(s.get("norm_long", 0), 4),
                 "signal_score": round(s.get("signal_score", 0), 4),
+                "final_score": round(s.get("final_score", s.get("position_signal", 0)), 4),
                 "direction": s.get("direction", "neutral"),
                 "position": round(s.get("position", 0) * 100, 1),
             })
@@ -76,8 +77,10 @@ async def get_intraday(
                 "price": s.get("price", 0),
                 "type": action,
                 "action": action,
+                "reason": s.get("reason", action),
                 "direction": s.get("direction", "neutral"),
                 "signal_score": round(s.get("signal_score", 0), 4),
+                "final_score": round(s.get("final_score", s.get("position_signal", 0)), 4),
                 "speed": round(s.get("speed", 0), 4),
                 "position_before": round(s.get("position_before", 0) * 100, 1),
                 "position_after": round(s.get("position_after", 0) * 100, 1),

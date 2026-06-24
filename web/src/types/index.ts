@@ -7,6 +7,7 @@ export interface OverviewMetrics {
   profit_loss_ratio: number
   total_trades: number
   avg_position: number
+  avg_position_ratio: number
   buy_adjustments: number
   sell_adjustments: number
   total_realized_pnl: number
@@ -65,6 +66,8 @@ export interface Trade {
   id: number
   time: string
   action: string
+  side: 'buy' | 'sell'
+  reason: string
   price: number
   position_before: number
   position_after: number
@@ -109,18 +112,29 @@ export interface TickPoint {
 
 export interface FeaturePoint {
   time: string
-  short_slope: number
-  long_slope: number
+  norm_short: number
+  norm_long: number
+  signal_score: number
+  final_score: number
   direction: string
+  position: number
 }
 
 export interface Signal {
   time: string
   price: number
+  type: 'buy' | 'sell'
   direction: string
   action: string
+  reason?: string
+  signal_score?: number
+  final_score?: number
   speed?: number
   position?: number
+  position_before?: number
+  position_after?: number
+  delta?: number
+  realized_pnl?: number
 }
 
 export interface IntradayData {

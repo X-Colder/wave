@@ -63,6 +63,16 @@ def _signed_strength(value: float, threshold: float = 0.03) -> float:
     return 0.0
 
 
+def _regime_score(regime: str) -> float:
+    return {
+        "uptrend": 0.28,
+        "reversal_watch": 0.18,
+        "down_exhaustion": 0.10,
+        "up_exhaustion": -0.08,
+        "downtrend": -0.30,
+    }.get(regime, 0.0)
+
+
 class TrendSignalAnalyzer:
     """
     Continuous multi-scale trend signal.
@@ -423,6 +433,9 @@ class BacktestEngine:
         carry: Optional[dict] = None
         trade_id = 0
 
+        if not trading_days:
+            return trades, equity_curve, daily_signals
+
         # Initial equity point
         equity_curve.append((
             datetime.combine(trading_days[0], dtime(9, 30)),
@@ -446,8 +459,9 @@ class BacktestEngine:
 
             daily_signals[d] = day_signals
 
-            if not day_trades:
-                equity_curve.append((datetime.combine(d, dtime(15, 0)), capital))
+            eod = datetime.combine(d, dtime(15, 0))
+            if not equity_curve or equity_curve[-1][0] != eod:
+                equity_curve.append((eod, capital))
 
         return trades, equity_curve, daily_signals
 
@@ -489,33 +503,44 @@ class BacktestEngine:
         s = self.settings
         trades: List[Trade] = []
         signals: List[dict] = []
-        capital = starting_capital
 
-        # Initialise position from overnight carry
+        # Cash/share accounting keeps realised P&L separate from mark-to-market
+        # equity. Existing carry files remain backward compatible.
         if carry_state:
-            position: float = carry_state["position_ratio"]
+            cash: float = float(carry_state.get("cash", 0.0))
+            shares: float = float(carry_state.get("shares", 0.0))
             avg_price: float = carry_state["avg_entry_price"]
-            sellable: float = carry_state["position_ratio"]
-            highest_since_entry: float = avg_price
+            if cash <= 0.0 and shares <= 0.0:
+                position_ratio = float(carry_state.get("position_ratio", 0.0))
+                shares = starting_capital * position_ratio / max(avg_price, 1e-9)
+                cash = starting_capital - shares * avg_price
+            sellable_shares: float = float(carry_state.get("sellable_shares", shares))
+            highest_since_entry: float = float(carry_state.get("highest_since_entry", avg_price))
+            loss_streak: int = int(carry_state.get("loss_streak", 0))
             regime_tracker = TrendRegimeTracker(carry_state.get("trend_state"))
         else:
-            position = 0.0
+            cash = starting_capital
+            shares = 0.0
             avg_price = 0.0
-            sellable = 0.0
+            sellable_shares = 0.0
             highest_since_entry = 0.0
+            loss_streak = 0
             regime_tracker = TrendRegimeTracker()
 
-        today_bought: float = 0.0
         last_trade_tick: int = -(s.min_trade_interval + 1)
         last_regime: str = "neutral"
+        peak_equity = max(starting_capital, 1.0)
+        day_realized_pnl = 0.0
 
         data = flow_engine.process_day(day, df)
         if not data:
-            return trades, signals, capital, _carry_out(
-                position, avg_price, regime_tracker.to_state()
+            return trades, signals, starting_capital, _carry_out(
+                cash, shares, avg_price, 0.0, regime_tracker.to_state(),
+                highest_since_entry, sellable_shares, loss_streak
             )
 
         prices = data["prices"]
+        volumes = data["volumes"]
         flows = data["flows"]
         times = data["times"]
         size_ema = data["size_ema"]
@@ -535,10 +560,14 @@ class BacktestEngine:
             tick_price = float(prices[i])
             tick_time = pd.Timestamp(times[i]).to_pydatetime()
             sig = float(signal_scores[i])
-            direction = str(directions[i])
             spd = float(speeds[i])
             trend_struct = str(trend_structures[i])
             signal_trend = str(signal_trends[i])
+            equity = max(cash + shares * tick_price, 1.0)
+            peak_equity = max(peak_equity, equity)
+            drawdown = (equity - peak_equity) / peak_equity
+            position = (shares * tick_price) / equity if equity > 0 else 0.0
+            sellable = (sellable_shares * tick_price) / equity if equity > 0 else 0.0
 
             # ------------------------------------------------------------------ #
             # Continuous trend signal                                             #
@@ -586,26 +615,60 @@ class BacktestEngine:
                 + price_200 * 0.15
             )
             position_signal = legacy_score
-            signal_strength = abs(position_signal)
-            if position_signal > 0.04:
+            regime = regime_tracker.update(tick_price, sig, trend_score)
+            regime_bias = _regime_score(regime["regime"])
+            final_score = _clip(
+                position_signal * 0.38
+                + trend_score * 0.30
+                + sig * 0.16
+                + regime_bias * 0.16
+            )
+
+            if final_score > 0.04:
                 signal_direction = "up"
-            elif position_signal < -0.04:
+            elif final_score < -0.04:
                 signal_direction = "down"
             else:
                 signal_direction = "neutral"
-            regime = regime_tracker.update(tick_price, sig, trend_score)
 
             # ------------------------------------------------------------------ #
-            # Map score to target position                                         #
+            # Map unified score to target position with risk budget                #
             # ------------------------------------------------------------------ #
-            min_pos = s.min_position
-            max_pos = s.max_position
-            if position_signal > 0:
-                target = min_pos + (max_pos - min_pos) * min(position_signal, 1.0)
-            elif position_signal < -0.1:
-                target = min_pos
+            start_vol = max(0, i - 200)
+            local_vol = 0.0
+            if i - start_vol > 5:
+                price_slice = prices[start_vol:i + 1]
+                rets = np.diff(price_slice) / np.maximum(price_slice[:-1], 1e-9)
+                local_vol = float(np.std(rets)) if len(rets) else 0.0
+
+            risk_scale = 1.0
+            if local_vol > 0.003:
+                risk_scale *= 0.75
+            if local_vol > 0.006:
+                risk_scale *= 0.65
+            if drawdown < -0.035:
+                risk_scale *= 0.70
+            if drawdown < -0.055:
+                risk_scale *= 0.55
+            if loss_streak >= 2:
+                risk_scale *= 0.80
+            if loss_streak >= 4:
+                risk_scale *= 0.65
+
+            min_pos = 0.0 if (
+                final_score < -0.06
+                or trend_score < -0.14
+                or regime["regime"] == "downtrend"
+            ) else min(s.min_position, s.max_position * 0.5)
+            max_pos = max(0.0, min(s.max_position * risk_scale, s.max_position))
+
+            if final_score > 0.03:
+                scaled = min((final_score - 0.03) / 0.62, 1.0)
+                target = min_pos + (max_pos - min_pos) * scaled
+            elif final_score < -0.05:
+                target = 0.0
             else:
-                target = position
+                target = min(position, max(min_pos, 0.12))
 
             trade_reason = "signal"
 
@@ -613,13 +676,13 @@ class BacktestEngine:
                 highest_since_entry = max(highest_since_entry, tick_price)
 
             stop_target: Optional[float] = None
-            if position > min_pos and sellable > 0 and avg_price > 0 and highest_since_entry > 0:
+            if position > 0.01 and sellable > 0 and avg_price > 0 and highest_since_entry > 0:
                 high_drawdown = (tick_price - highest_since_entry) / highest_since_entry
                 entry_return = (tick_price - avg_price) / avg_price
                 peak_return = (highest_since_entry - avg_price) / avg_price
 
-                if entry_return <= -0.028:
-                    stop_target = min_pos
+                if entry_return <= -0.026:
+                    stop_target = 0.0
                 elif peak_return >= 0.050 and high_drawdown <= -0.028:
                     stop_target = max(min_pos, position - 0.35)
                 elif peak_return >= 0.030 and high_drawdown <= -0.018:
@@ -732,6 +795,7 @@ class BacktestEngine:
                     "trend_delta": round(trend_delta, 4),
                     "legacy_score": round(legacy_score, 4),
                     "position_signal": round(position_signal, 4),
+                    "final_score": round(final_score, 4),
                     "recent_score": round(recent_score, 4),
                     "anchor_score": round(anchor_score, 4),
                     "coverage_score": round(cover_score, 4),
@@ -740,6 +804,8 @@ class BacktestEngine:
                     "regime_cover": round(regime["cover_ratio"], 4),
                     "regime_speed": round(regime["speed_ratio"], 4),
                     "regime_reversal_score": round(regime["reversal_score"], 4),
+                    "risk_scale": round(risk_scale, 4),
+                    "equity": round(equity, 2),
                     "target_position": round(target, 4),
                     "action": "sample",
                 })
@@ -759,28 +825,38 @@ class BacktestEngine:
                 max_eod = min_pos + (0.5 - min_pos) * (remaining / 1800.0)
                 target = min(target, max_eod)
 
-            target = max(min_pos, min(target, max_pos))
+            target = max(0.0, min(target, max_pos))
 
             # ------------------------------------------------------------------ #
             # Adjust toward target (only on significant change)                 #
             # ------------------------------------------------------------------ #
-            delta = target - position
+            desired_value = target * equity
+            current_value = shares * tick_price
+            delta_value = desired_value - current_value
 
-            # T+1 constraint on buys
-            if delta > 0:
-                add_room = 0.45 if (strong_reversal or confirmed_uptrend) else 0.3
-                max_buy = sellable + add_room
-                target = min(target, max_buy)
-                delta = target - position
+            if delta_value > 0:
+                add_room = 0.45 if (strong_reversal or confirmed_uptrend) else 0.30
+                max_position_after_buy = min(max_pos, sellable + add_room)
+                max_value_after_buy = max_position_after_buy * equity
+                delta_value = min(delta_value, max(0.0, max_value_after_buy - current_value))
+                max_cash_buy = cash / (1.0 + s.commission_rate)
+                delta_value = min(delta_value, max_cash_buy)
+            elif delta_value < 0:
+                max_sell_value = sellable_shares * tick_price
+                delta_value = -min(abs(delta_value), max_sell_value)
 
-            # T+1 constraint on sells: only sellable shares
-            elif delta < 0:
-                actual_sell = min(abs(delta), sellable)
-                delta = -actual_sell
+            tick_volume_value = float(volumes[i]) * tick_price
+            max_fill_value = max(tick_volume_value * 0.20, equity * 0.015)
+            if delta_value > 0:
+                delta_value = min(delta_value, max_fill_value)
+            elif delta_value < 0:
+                delta_value = -min(abs(delta_value), max_fill_value)
+
+            position_delta_est = delta_value / equity if equity > 0 else 0.0
 
             # Only act on meaningful changes; continuous trend updates can
             # still resize in 5% steps when strength changes persist.
-            if abs(delta) < max(s.min_position_delta, 0.05):
+            if abs(position_delta_est) < max(s.min_position_delta, 0.05):
                 last_regime = regime["regime"]
                 continue
 
@@ -788,9 +864,6 @@ class BacktestEngine:
             if (i - last_trade_tick) < s.min_trade_interval:
                 last_regime = regime["regime"]
                 continue
-            elif delta < 0:
-                actual_sell = min(abs(delta), sellable)
-                delta = -actual_sell
 
             # (checks already above)
 
@@ -798,39 +871,58 @@ class BacktestEngine:
             # Execute trade                                                        #
             # ------------------------------------------------------------------ #
             position_before = position
+            shares_before = shares
             realized_pnl: float
 
-            if delta > 0:
+            if delta_value > 0:
                 exec_price = tick_price * (1.0 + s.slippage_rate)
-                commission = abs(delta) * capital * s.commission_rate
+                buy_shares = delta_value / exec_price
+                notional = buy_shares * exec_price
+                commission = notional * s.commission_rate
+                if notional + commission > cash:
+                    buy_shares = cash / (exec_price * (1.0 + s.commission_rate))
+                    notional = buy_shares * exec_price
+                    commission = notional * s.commission_rate
 
-                if position > 0 and avg_price > 0:
-                    old_val = position * avg_price
-                    new_val = delta * exec_price
-                    avg_price = (old_val + new_val) / (position + delta)
+                if shares > 0 and avg_price > 0:
+                    old_val = shares * avg_price
+                    new_val = buy_shares * exec_price
+                    avg_price = (old_val + new_val) / (shares + buy_shares)
                 else:
                     avg_price = exec_price
 
-                position += delta
-                today_bought += delta
-                capital -= commission
+                shares += buy_shares
+                cash -= notional + commission
                 realized_pnl = -commission
                 highest_since_entry = max(highest_since_entry, tick_price)
+                side = "buy"
 
             else:  # sell
-                sell_qty = abs(delta)
                 exec_price = tick_price * (1.0 - s.slippage_rate)
-                commission = sell_qty * capital * s.commission_rate
+                sell_shares = min(abs(delta_value) / exec_price, sellable_shares, shares)
+                notional = sell_shares * exec_price
+                commission = notional * s.commission_rate
+                realized_pnl = sell_shares * (exec_price - avg_price) - commission
+                cash += notional - commission
+                shares = max(0.0, shares - sell_shares)
+                sellable_shares = max(0.0, sellable_shares - sell_shares)
+                day_realized_pnl += realized_pnl
+                if realized_pnl < 0:
+                    loss_streak += 1
+                elif realized_pnl > 0:
+                    loss_streak = 0
+                if shares <= 1e-8:
+                    shares = 0.0
+                    avg_price = 0.0
+                    highest_since_entry = 0.0
+                side = "sell"
 
-                gross_ret = (exec_price - avg_price) / avg_price if avg_price > 0 else 0.0
-                realized_pnl = sell_qty * capital * gross_ret - commission
-
-                capital += realized_pnl
-                position += delta
-                position = max(0.0, position)
-                sellable = max(0.0, sellable - sell_qty)
-                if position <= min_pos:
-                    highest_since_entry = tick_price
+            equity_after = max(cash + shares * tick_price, 1.0)
+            position = (shares * tick_price) / equity_after if equity_after > 0 else 0.0
+            delta = position - position_before
+            if abs(delta) < 1e-9:
+                last_regime = regime["regime"]
+                continue
 
             last_trade_tick = i
 
@@ -845,9 +937,9 @@ class BacktestEngine:
                 position_delta=delta,
                 direction=signal_direction,
                 speed=max(spd, trend_speed),
-                signal_score=position_signal,
+                signal_score=final_score,
                 realized_pnl=realized_pnl,
-                capital_after=capital,
+                capital_after=equity_after,
             )
             trades.append(trade)
 
@@ -868,6 +960,7 @@ class BacktestEngine:
                 "trend_delta": round(trend_delta, 4),
                 "legacy_score": round(legacy_score, 4),
                 "position_signal": round(position_signal, 4),
+                "final_score": round(final_score, 4),
                 "recent_score": round(recent_score, 4),
                 "anchor_score": round(anchor_score, 4),
                 "coverage_score": round(cover_score, 4),
@@ -876,17 +969,24 @@ class BacktestEngine:
                 "regime_cover": round(regime["cover_ratio"], 4),
                 "regime_speed": round(regime["speed_ratio"], 4),
                 "regime_reversal_score": round(regime["reversal_score"], 4),
+                "risk_scale": round(risk_scale, 4),
+                "equity": round(equity_after, 2),
                 "target_position": round(target, 4),
-                "action": "buy" if delta > 0 else trade_reason,
+                "action": side,
+                "side": side,
+                "reason": trade_reason,
                 "position_before": round(position_before, 4),
                 "position_after": round(position, 4),
                 "delta": round(delta, 4),
+                "shares_before": round(shares_before, 2),
+                "shares_after": round(shares, 2),
                 "realized_pnl": round(realized_pnl, 2),
             })
             last_regime = regime["regime"]
-
-        return trades, signals, capital, _carry_out(
-            position, avg_price, regime_tracker.to_state()
+        ending_equity = cash + shares * float(prices[-1])
+        return trades, signals, ending_equity, _carry_out(
+            cash, shares, avg_price, float(prices[-1]), regime_tracker.to_state(),
+            highest_since_entry, shares, loss_streak
         )
 
     @staticmethod
@@ -903,14 +1003,26 @@ class BacktestEngine:
 
 
 def _carry_out(
-    position: float,
+    cash: float,
+    shares: float,
     avg_price: float,
+    last_price: float,
     trend_state: Optional[dict] = None,
+    highest_since_entry: float = 0.0,
+    sellable_shares: float = 0.0,
+    loss_streak: int = 0,
 ) -> Optional[dict]:
-    if position > 0.01:
+    equity = cash + shares * max(last_price, avg_price, 0.0)
+    position = (shares * max(last_price, avg_price, 0.0)) / equity if equity > 0 else 0.0
+    if shares > 1e-8 and position > 0.01:
         return {
+            "cash": cash,
+            "shares": shares,
+            "sellable_shares": sellable_shares,
             "position_ratio": position,
             "avg_entry_price": avg_price,
+            "highest_since_entry": highest_since_entry,
+            "loss_streak": loss_streak,
             "trend_state": trend_state or {},
         }
     return None

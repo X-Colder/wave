@@ -44,6 +44,8 @@ async def list_trades(
             "id": t.trade_id,
             "time": t.time.isoformat(),
             "action": "加仓" if t.position_delta > 0 else "减仓",
+            "side": "buy" if t.position_delta > 0 else "sell",
+            "reason": t.action,
             "price": round(t.price, 4),
             "position_before": round(t.position_before * 100, 1),
             "position_after": round(t.position_after * 100, 1),

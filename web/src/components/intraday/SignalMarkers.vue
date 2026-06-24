@@ -13,7 +13,7 @@ defineProps<{
     </template>
     <el-table :data="signals" size="small" style="width: 100%" max-height="180">
       <el-table-column label="时间" width="70">
-        <template #default="{ row }">{{ row.time.slice(11, 16) }}</template>
+        <template #default="{ row }">{{ row.time.slice(0, 5) }}</template>
       </el-table-column>
       <el-table-column label="类型" width="60">
         <template #default="{ row }">
@@ -25,9 +25,14 @@ defineProps<{
       <el-table-column label="价格" width="80">
         <template #default="{ row }">{{ row.price.toFixed(2) }}</template>
       </el-table-column>
-      <el-table-column prop="pattern_id" label="模式ID">
+      <el-table-column label="仓位" width="90">
         <template #default="{ row }">
-          <span class="text-neutral">{{ row.pattern_id }}</span>
+          <span class="text-neutral">{{ row.position_after?.toFixed(1) }}%</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="原因">
+        <template #default="{ row }">
+          <span class="text-neutral">{{ row.reason || row.action }}</span>
         </template>
       </el-table-column>
     </el-table>

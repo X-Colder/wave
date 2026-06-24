@@ -43,6 +43,7 @@ async def get_overview(result: BacktestResult = Depends(get_result)):
         "realized_pnl_from_sells": round(m.get("realized_pnl_from_sells", 0), 2),
         # Position metrics
         "avg_position_ratio": round(m.get("avg_position_ratio", 0), 4),
+        "avg_position": round(m.get("avg_position_ratio", 0), 4),
         "position_turnover": round(m.get("position_turnover", 0), 4),
         # Legacy alias for frontend
         "total_trades": int(m.get("total_trades", 0)),

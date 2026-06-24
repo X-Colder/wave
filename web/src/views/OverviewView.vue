@@ -52,7 +52,7 @@ const kpiCards = computed(() => {
     },
     {
       title: '平均仓位',
-      value: pct(m.avg_position ?? 0),
+      value: pct(m.avg_position_ratio ?? m.avg_position ?? 0),
       valueClass: 'text-neutral',
       subtext: `加${m.buy_adjustments ?? 0} 减${m.sell_adjustments ?? 0}`,
     },
