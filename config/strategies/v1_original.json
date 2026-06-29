@@ -1,0 +1,31 @@
+{
+    "name": "v1_original",
+    "description": "原始策略，无日线MACD regime，纯tick级信号",
+    "created": "2026-06-24",
+    "params": {
+        "train_days": 235,
+        "param_search_trials": 0,
+        "min_position": 0.2,
+        "max_position": 0.8,
+        "min_position_delta": 0.125,
+        "min_trade_interval": 100,
+        "commission_rate": 0.001,
+        "slippage_rate": 0.0001,
+        "initial_capital": 100000.0,
+        "market_mode": "t1",
+        "macd_fast": 0,
+        "macd_slow": 0,
+        "macd_signal": 0
+    },
+    "backtest": {
+        "stocks": ["002484"],
+        "period": "2017-05 ~ 2018-01",
+        "result": {
+            "return": -11.9,
+            "max_drawdown": -15.98,
+            "sharpe": -1.82,
+            "win_rate": 46.9
+        }
+    },
+    "notes": "策略核心问题：TrendRegimeTracker用tick级cover_ratio判断日线趋势，97%时间标记为up_exhaustion"
+}

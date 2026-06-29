@@ -1,0 +1,32 @@
+{
+    "name": "v2_standard_macd",
+    "description": "加入日线MACD(12,26,9)做regime分类，DIF>0持仓，DIF<0空仓",
+    "created": "2026-06-29",
+    "params": {
+        "train_days": 235,
+        "param_search_trials": 0,
+        "min_position": 0.2,
+        "max_position": 0.8,
+        "min_position_delta": 0.125,
+        "min_trade_interval": 100,
+        "commission_rate": 0.001,
+        "slippage_rate": 0.0001,
+        "initial_capital": 100000.0,
+        "market_mode": "t1",
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9
+    },
+    "backtest": {
+        "stocks": ["002484"],
+        "period": "2017-05 ~ 2018-05",
+        "result": {
+            "return": 0.0,
+            "max_drawdown": -4.96,
+            "sharpe": 0.77,
+            "win_rate": 58.6,
+            "note": "防守好(避跌80%)但进攻差(捕涨23%)"
+        }
+    },
+    "notes": "解决了regime判断问题，但标准MACD参数滞后严重，6月反弹完全错过"
+}

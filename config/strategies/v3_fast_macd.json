@@ -1,0 +1,35 @@
+{
+    "name": "v3_fast_macd",
+    "description": "快速MACD(5,10,4)，缩短EMA周期提前入场出场，18只股票100%跑赢标准参数",
+    "created": "2026-06-29",
+    "params": {
+        "train_days": 235,
+        "param_search_trials": 0,
+        "min_position": 0.2,
+        "max_position": 0.8,
+        "min_position_delta": 0.125,
+        "min_trade_interval": 100,
+        "commission_rate": 0.001,
+        "slippage_rate": 0.0001,
+        "initial_capital": 100000.0,
+        "market_mode": "t1",
+        "macd_fast": 5,
+        "macd_slow": 10,
+        "macd_signal": 4
+    },
+    "backtest": {
+        "stocks": ["000004","000025","000036","000048","000063","000100","000158","000338","000423","000528","000637","000725","000807","000937","002024","002049","002230","002484"],
+        "period": "2017-2018",
+        "result": {
+            "avg_return": 28.8,
+            "avg_max_drawdown": -10.0,
+            "avg_buy_hold": -34.8,
+            "win_count": "18/18",
+            "best": {"stock": "002049", "return": 48.2},
+            "worst": {"stock": "000807", "return": 9.6},
+            "capture_rate": 50,
+            "avoid_rate": 73
+        }
+    },
+    "notes": "当前默认策略。快速参数牺牲7%避跌率换取27%捕涨率提升，净效果远优于标准参数。待验证：大盘股+上涨市场表现"
+}

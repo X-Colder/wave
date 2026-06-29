@@ -1,9 +1,13 @@
+import json
+import os
+from pathlib import Path
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
 
 class Settings(BaseSettings):
     data_dir: str = Field(default="./002484", alias="DATA_DIR")
+    strategy: str = Field(default="", alias="STRATEGY")
 
     # Parameter learning: use first N days to optimize params via random search
     train_days: int = 235
@@ -38,4 +42,30 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env", "populate_by_name": True}
 
 
-settings = Settings()
+def _load_strategy(strategy_name: str) -> dict:
+    """Load strategy params from config/strategies/{name}.json"""
+    search_paths = [
+        Path("config/strategies") / f"{strategy_name}.json",
+        Path(__file__).parent.parent.parent / "config" / "strategies" / f"{strategy_name}.json",
+    ]
+    for p in search_paths:
+        if p.exists():
+            with open(p) as f:
+                data = json.load(f)
+            return data.get("params", {})
+    return {}
+
+
+def load_settings() -> Settings:
+    base = Settings()
+    strategy_name = base.strategy or os.environ.get("STRATEGY", "")
+    if strategy_name:
+        overrides = _load_strategy(strategy_name)
+        if overrides:
+            merged = base.model_dump()
+            merged.update({k: v for k, v in overrides.items() if k in merged and v is not None})
+            return Settings.model_validate(merged)
+    return base
+
+
+settings = load_settings()
