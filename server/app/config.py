@@ -25,10 +25,10 @@ class Settings(BaseSettings):
     # Market mode: "t1" = A-share T+1, "t0" = T+0 (futures/crypto)
     market_mode: str = "t1"
 
-    # Daily MACD regime parameters
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
+    # Daily MACD regime parameters (5,10,4 validated across 18 stocks)
+    macd_fast: int = 5
+    macd_slow: int = 10
+    macd_signal: int = 4
 
     # T+0 specific parameters
     t0_allow_short: bool = False
