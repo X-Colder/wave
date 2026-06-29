@@ -22,6 +22,19 @@ class Settings(BaseSettings):
     slippage_rate: float = 0.0001
     initial_capital: float = 100000.0
 
+    # Market mode: "t1" = A-share T+1, "t0" = T+0 (futures/crypto)
+    market_mode: str = "t1"
+
+    # Daily MACD regime parameters
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+
+    # T+0 specific parameters
+    t0_allow_short: bool = False
+    t0_max_trades_per_day: int = 20
+    t0_intraday_close: bool = True
+
     model_config = {"env_file": ".env", "populate_by_name": True}
 
 

@@ -8,6 +8,7 @@ from typing import List, Dict, Tuple, Optional
 from .models import Trade, BacktestResult
 from .data_loader import DataLoader
 from .flow_engine import FlowEngine
+from .daily_regime import DailyRegimeClassifier, DailyRegime
 from .metrics import compute_all_metrics, monthly_returns
 from ..config import Settings
 
@@ -405,11 +406,18 @@ class BacktestEngine:
         carry: Optional[dict] = None
         total_pnl = 0.0
 
+        classifier = DailyRegimeClassifier(
+            self.settings.macd_fast, self.settings.macd_slow, self.settings.macd_signal
+        )
+        daily_closes: List[float] = []
+
         for d in days_list:
             df = self.loader.load_day(d)
             if df is None or len(df) == 0:
                 continue
-            trades, _, capital, carry = self._trade_day(d, df, capital, carry, engine, params)
+            daily_closes.append(float(df["Price"].iloc[-1]))
+            daily_regime = classifier.classify(daily_closes)
+            trades, _, capital, carry = self._trade_day(d, df, capital, carry, engine, params, daily_regime=daily_regime)
             total_pnl += sum(t.realized_pnl for t in trades)
 
         return total_pnl
@@ -436,6 +444,24 @@ class BacktestEngine:
         if not trading_days:
             return trades, equity_curve, daily_signals
 
+        # Daily regime classifier
+        classifier = DailyRegimeClassifier(s.macd_fast, s.macd_slow, s.macd_signal)
+
+        # Build daily_closes from ALL available days (including training days)
+        # so the MACD has enough history when test days start
+        all_days = self.loader.discover_trading_days()
+        daily_closes: List[float] = []
+        for d in all_days:
+            if d >= trading_days[0]:
+                break
+            df = self.loader.load_day(d)
+            if df is not None and len(df) > 0:
+                daily_closes.append(float(df["Price"].iloc[-1]))
+
+        # Pre-warm classifier state
+        if daily_closes:
+            classifier.classify(daily_closes)
+
         # Initial equity point
         equity_curve.append((
             datetime.combine(trading_days[0], dtime(9, 30)),
@@ -447,8 +473,11 @@ class BacktestEngine:
             if df is None or len(df) == 0:
                 continue
 
+            daily_closes.append(float(df["Price"].iloc[-1]))
+            daily_regime = classifier.classify(daily_closes)
+
             day_trades, day_signals, capital, carry = self._trade_day(
-                d, df, capital, carry, engine, params
+                d, df, capital, carry, engine, params, daily_regime=daily_regime
             )
 
             for t in day_trades:
@@ -477,6 +506,7 @@ class BacktestEngine:
         carry_state: Optional[dict],
         flow_engine: FlowEngine,
         params: dict,
+        daily_regime: Optional[DailyRegime] = None,
     ) -> Tuple[List[Trade], List[dict], float, Optional[dict]]:
         """
         Simulate one trading day using a unified multi-scale trend score.
@@ -514,7 +544,10 @@ class BacktestEngine:
                 position_ratio = float(carry_state.get("position_ratio", 0.0))
                 shares = starting_capital * position_ratio / max(avg_price, 1e-9)
                 cash = starting_capital - shares * avg_price
-            sellable_shares: float = float(carry_state.get("sellable_shares", shares))
+            if s.market_mode == "t0":
+                sellable_shares = shares
+            else:
+                sellable_shares = float(carry_state.get("sellable_shares", shares))
             highest_since_entry: float = float(carry_state.get("highest_since_entry", avg_price))
             loss_streak: int = int(carry_state.get("loss_streak", 0))
             regime_tracker = TrendRegimeTracker(carry_state.get("trend_state"))
@@ -617,12 +650,21 @@ class BacktestEngine:
             position_signal = legacy_score
             regime = regime_tracker.update(tick_price, sig, trend_score)
             regime_bias = _regime_score(regime["regime"])
-            final_score = _clip(
-                position_signal * 0.38
-                + trend_score * 0.30
-                + sig * 0.16
-                + regime_bias * 0.16
-            )
+
+            # Use daily regime to modulate signal; tick-level regime as secondary
+            if daily_regime and daily_regime.regime != "NEUTRAL":
+                final_score = _clip(
+                    position_signal * 0.40
+                    + trend_score * 0.35
+                    + sig * 0.25
+                )
+            else:
+                final_score = _clip(
+                    position_signal * 0.38
+                    + trend_score * 0.30
+                    + sig * 0.16
+                    + regime_bias * 0.16
+                )
 
             if final_score > 0.04:
                 signal_direction = "up"
@@ -655,12 +697,21 @@ class BacktestEngine:
             if loss_streak >= 4:
                 risk_scale *= 0.65
 
-            min_pos = 0.0 if (
-                final_score < -0.06
-                or trend_score < -0.14
-                or regime["regime"] == "downtrend"
-            ) else min(s.min_position, s.max_position * 0.5)
-            max_pos = max(0.0, min(s.max_position * risk_scale, s.max_position))
+            # Daily regime constrains position limits
+            dr_scale = daily_regime.max_position_scale if daily_regime else 1.0
+            dr_min = daily_regime.min_position_override if daily_regime else s.min_position
+
+            if dr_scale <= 0.0 and s.market_mode == "t1":
+                min_pos = 0.0
+                max_pos = 0.0
+            else:
+                min_pos = 0.0 if (
+                    final_score < -0.06
+                    or trend_score < -0.14
+                    or regime["regime"] == "downtrend"
+                    or (daily_regime and daily_regime.regime == "BEAR")
+                ) else min(dr_min, s.max_position * dr_scale * 0.5)
+                max_pos = max(0.0, min(s.max_position * dr_scale * risk_scale, s.max_position))
 
             if final_score > 0.03:
                 scaled = min((final_score - 0.03) / 0.62, 1.0)
@@ -668,7 +719,7 @@ class BacktestEngine:
             elif final_score < -0.05:
                 target = 0.0
             else:
-                target = min(position, max(min_pos, 0.12))
+                target = min(position, max(min_pos, 0.12 * dr_scale))
 
             trade_reason = "signal"
 
@@ -807,6 +858,9 @@ class BacktestEngine:
                     "risk_scale": round(risk_scale, 4),
                     "equity": round(equity, 2),
                     "target_position": round(target, 4),
+                    "daily_regime": daily_regime.regime if daily_regime else "NEUTRAL",
+                    "daily_macd_dif": round(daily_regime.dif, 4) if daily_regime else 0.0,
+                    "daily_macd_dea": round(daily_regime.dea, 4) if daily_regime else 0.0,
                     "action": "sample",
                 })
 
@@ -835,14 +889,20 @@ class BacktestEngine:
             delta_value = desired_value - current_value
 
             if delta_value > 0:
-                add_room = 0.45 if (strong_reversal or confirmed_uptrend) else 0.30
-                max_position_after_buy = min(max_pos, sellable + add_room)
+                if s.market_mode == "t0":
+                    max_position_after_buy = max_pos
+                else:
+                    add_room = 0.45 if (strong_reversal or confirmed_uptrend) else 0.30
+                    max_position_after_buy = min(max_pos, sellable + add_room)
                 max_value_after_buy = max_position_after_buy * equity
                 delta_value = min(delta_value, max(0.0, max_value_after_buy - current_value))
                 max_cash_buy = cash / (1.0 + s.commission_rate)
                 delta_value = min(delta_value, max_cash_buy)
             elif delta_value < 0:
-                max_sell_value = sellable_shares * tick_price
+                if s.market_mode == "t0":
+                    max_sell_value = shares * tick_price
+                else:
+                    max_sell_value = sellable_shares * tick_price
                 delta_value = -min(abs(delta_value), max_sell_value)
 
             tick_volume_value = float(volumes[i]) * tick_price
@@ -899,13 +959,17 @@ class BacktestEngine:
 
             else:  # sell
                 exec_price = tick_price * (1.0 - s.slippage_rate)
-                sell_shares = min(abs(delta_value) / exec_price, sellable_shares, shares)
+                if s.market_mode == "t0":
+                    sell_shares = min(abs(delta_value) / exec_price, shares)
+                else:
+                    sell_shares = min(abs(delta_value) / exec_price, sellable_shares, shares)
                 notional = sell_shares * exec_price
                 commission = notional * s.commission_rate
                 realized_pnl = sell_shares * (exec_price - avg_price) - commission
                 cash += notional - commission
                 shares = max(0.0, shares - sell_shares)
-                sellable_shares = max(0.0, sellable_shares - sell_shares)
+                if s.market_mode != "t0":
+                    sellable_shares = max(0.0, sellable_shares - sell_shares)
                 day_realized_pnl += realized_pnl
                 if realized_pnl < 0:
                     loss_streak += 1
@@ -972,6 +1036,7 @@ class BacktestEngine:
                 "risk_scale": round(risk_scale, 4),
                 "equity": round(equity_after, 2),
                 "target_position": round(target, 4),
+                "daily_regime": daily_regime.regime if daily_regime else "NEUTRAL",
                 "action": side,
                 "side": side,
                 "reason": trade_reason,
@@ -983,6 +1048,19 @@ class BacktestEngine:
                 "realized_pnl": round(realized_pnl, 2),
             })
             last_regime = regime["regime"]
+
+        # T+0 intraday close: flatten all positions at end of day
+        if s.market_mode == "t0" and s.t0_intraday_close and shares > 1e-8:
+            close_price = float(prices[-1]) * (1.0 - s.slippage_rate)
+            notional = shares * close_price
+            commission = notional * s.commission_rate
+            realized_pnl = shares * (close_price - avg_price) - commission
+            cash += notional - commission
+            day_realized_pnl += realized_pnl
+            shares = 0.0
+            avg_price = 0.0
+            highest_since_entry = 0.0
+
         ending_equity = cash + shares * float(prices[-1])
         return trades, signals, ending_equity, _carry_out(
             cash, shares, avg_price, float(prices[-1]), regime_tracker.to_state(),
